@@ -673,16 +673,16 @@ def main():
     if args.dtype:
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
 
-    device = args.device or "cpu"
+    device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
     calib_texts = None
     epochs = args.epochs or 3
     lr = args.lr or 5e-4
     batch_size = args.batch_size or 1
     max_len = args.max_len or 512
 
-    if teacher_id:
-        if interactive and not args.device:
-            print("\n--- distillation settings ---")
+        if teacher_id:
+            if interactive and not args.device:
+                print("\n--- distillation settings ---")
             device = pick_device()
             epochs = int(ask("epochs", default=str(epochs)))
             lr = float(ask("learning rate", default=str(lr)))
@@ -725,8 +725,6 @@ def main():
                           calib_texts, epochs, batch_size, lr, max_len, device)
     elif moe_flag:
         print("running expert-batched PTQ...")
-        if device == "cpu" and torch.cuda.is_available():
-            device = pick_device() if interactive else "cuda:0"
         student = quantize_experts_batched(
             student, quant_fn, dtype,
             batch_size=manual_batch,
