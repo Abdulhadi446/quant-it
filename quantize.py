@@ -971,7 +971,7 @@ def main():
     packed_size = packed_path.stat().st_size
     ratio = orig_size / packed_size if packed_size > 0 else float("inf")
     print(f"  compression: {orig_size/1024**3:.1f} GB (fp16) → "
-          f"{packed_size/1024**3:.2f} GB ({ratio:.0f}x)"))
+          f"{packed_size/1024**3:.2f} GB ({ratio:.0f}x)")
 
 
 if __name__ == "__main__":
