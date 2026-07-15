@@ -88,11 +88,13 @@ cd quant-it
 ```
 
 The interactive wizard will prompt you for:
-1. Student model (any HF model name or local path)
-2. Teacher model (optional — enables distillation)
-3. Quantization mode (1-bit or ternary)
-4. Expert batch size (auto or manual)
-5. Output directory
+1. **Preset** — choose from pre-configured models (Qwen3.6-35B-A3B, Llama-3-8B, etc.)
+2. **Or custom** — manual configuration
+3. Student model (any HF model name or local path)
+4. Teacher model (optional — enables distillation)
+5. Quantization mode (1-bit or ternary)
+6. Expert batch size (auto or manual)
+7. Output directory
 
 ---
 
@@ -223,17 +225,17 @@ model.save_pretrained("llama3-8b-1bit")
 
 ### Running from Jupyter / Kaggle
 
-Shell commands need `!` prefix. Use `--model` flag (no interactive prompts):
+Shell commands need `!` prefix. Use `--model` or `--preset` flags (no interactive prompts):
 
 ```python
 # wrong — causes SyntaxError
 # ./quant.sh
 
-# correct — run from terminal
-!./quant.sh --model Qwen/Qwen2.5-0.5B
+# correct — run with preset
+!./quant.sh --preset qwen35b
 
-# or run python directly with CLI args
-!python quantize.py --model Qwen/Qwen2.5-0.5B --mode ternary
+# or run python directly with preset
+!python quantize.py --preset qwen35b
 
 # with teacher distillation
 !python quantize.py \
@@ -245,10 +247,13 @@ Shell commands need `!` prefix. Use `--model` flag (no interactive prompts):
 
 # MoE model with custom expert batch
 !python quantize.py \
-  --model Qwen/Qwen3-30B-A3B \
+  --model Qwen/Qwen3.6-35B-A3B \
   --mode ternary \
   --expert-batch 8 \
-  --output qwen3-moe-ternary
+  --output qwen35b-ternary
+
+# list available presets
+!python quantize.py --preset list
 ```
 
 ### One-Liner Examples

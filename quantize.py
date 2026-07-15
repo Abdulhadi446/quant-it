@@ -492,6 +492,45 @@ def hardware_check(load_4bit):
 
 
 # ---------------------------------------------------------------------------
+# presets
+# ---------------------------------------------------------------------------
+
+PRESETS = {
+    "qwen35b": {
+        "name": "Qwen3.6-35B-A3B (MoE)",
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "mode": "ternary",
+        "load_4bit": False,
+        "dtype": "fp16",
+        "expert_batch": None,
+    },
+    "qwen30b": {
+        "name": "Qwen3-30B-A3B (MoE)",
+        "model": "Qwen/Qwen3-30B-A3B",
+        "mode": "ternary",
+        "load_4bit": False,
+        "dtype": "fp16",
+        "expert_batch": None,
+    },
+    "llama8b": {
+        "name": "Llama-3-8B (dense)",
+        "model": "meta-llama/Llama-3-8B",
+        "mode": "ternary",
+        "load_4bit": True,
+        "dtype": "fp16",
+        "expert_batch": None,
+    },
+    "qwen05b": {
+        "name": "Qwen2.5-0.5B (dense, quick test)",
+        "model": "Qwen/Qwen2.5-0.5B",
+        "mode": "ternary",
+        "load_4bit": False,
+        "dtype": "fp16",
+        "expert_batch": None,
+    },
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -501,9 +540,29 @@ def _is_interactive():
     return sys.stdin.isatty() if hasattr(sys.stdin, 'isatty') else False
 
 
+def _apply_preset(preset_key):
+    """Apply a preset and return config dict."""
+    p = PRESETS[preset_key]
+    print(f"\n  preset: {p['name']}")
+    mode_name = p["mode"]
+    quant_fn = onebit_weight if mode_name == "1bit" else ternary_weight
+    return {
+        "model_id": p["model"],
+        "teacher_id": "",
+        "mode_name": mode_name,
+        "quant_fn": quant_fn,
+        "load_4bit": p["load_4bit"],
+        "manual_batch": p["expert_batch"],
+        "out_dir": f"{p['model'].split('/')[-1]}-{mode_name}",
+        "dtype": {"fp16": torch.float16, "bf16": torch.bfloat16}[p["dtype"]],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="1-bit / ternary quantizer")
     parser.add_argument("--model", "-m", default=None, help="student model (HF name or path)")
+    parser.add_argument("--preset", choices=list(PRESETS.keys()) + ["list"], default=None,
+                        help="use a preset config (use 'list' to show available presets)")
     parser.add_argument("--teacher", "-t", default=None, help="teacher model (enables distillation)")
     parser.add_argument("--mode", choices=["1bit", "ternary"], default=None, help="quantization mode")
     parser.add_argument("--output", "-o", default=None, help="output directory")
@@ -518,71 +577,101 @@ def main():
     parser.add_argument("--expert-batch", type=int, default=None, help="MoE experts per batch")
     args, _ = parser.parse_known_args()
 
+    # --preset list
+    if args.preset == "list":
+        print("\navailable presets:")
+        for k, v in PRESETS.items():
+            print(f"  {k:12s}  {v['model']}  ({v['mode']})")
+        return
+
     interactive = _is_interactive()
 
     print("=" * 60)
     print("  1-bit / ternary quantizer (Unsloth + dual T4)")
     print("=" * 60)
 
-    # --- collect settings (CLI args or interactive) ---
-    if args.model:
-        model_id = args.model
-    elif interactive:
-        model_id = ask("\nstudent model (HF name or local path)")
+    # --- preset or interactive mode ---
+    if args.preset:
+        cfg = _apply_preset(args.preset)
+        model_id = cfg["model_id"]
+        teacher_id = cfg["teacher_id"]
+        mode_name = cfg["mode_name"]
+        quant_fn = cfg["quant_fn"]
+        load_4bit = cfg["load_4bit"]
+        manual_batch = cfg["manual_batch"]
+        out_dir = cfg["out_dir"]
+        dtype = cfg["dtype"]
     else:
-        print("ERROR: --model is required in non-interactive mode")
-        parser.print_help()
-        sys.exit(1)
+        # defaults for non-interactive (args.model) case
+        teacher_id = ""
+        mode_name = "ternary"
+        quant_fn = ternary_weight
+        load_4bit = False
+        manual_batch = None
+        dtype = torch.float16
+        out_dir = None
 
+        if args.model:
+            model_id = args.model
+        elif interactive:
+            print("\npresets:")
+            keys = list(PRESETS.keys())
+            for i, k in enumerate(keys):
+                print(f"  [{i+1}] {PRESETS[k]['name']}")
+            print(f"  [{len(keys)+1}] custom")
+            pidx = ask("pick", default="1", options=[str(i+1) for i in range(len(keys)+1)])
+            pidx = int(pidx)
+            if 1 <= pidx <= len(keys):
+                cfg = _apply_preset(keys[pidx - 1])
+                model_id = cfg["model_id"]
+                teacher_id = cfg["teacher_id"]
+                mode_name = cfg["mode_name"]
+                quant_fn = cfg["quant_fn"]
+                load_4bit = cfg["load_4bit"]
+                manual_batch = cfg["manual_batch"]
+                out_dir = cfg["out_dir"]
+                dtype = cfg["dtype"]
+            else:
+                model_id = ask("\nstudent model (HF name or local path)")
+                teacher_id = ask("teacher model (HF name/path, or empty for PTQ)", default="")
+                print("\nquantization mode:")
+                print("  [1] 1bit    — binary {-1, +1}")
+                print("  [2] ternary — ternary {-1, 0, +1}")
+                mode_key = ask("pick", default="2", options=["1", "2"])
+                mode_name, quant_fn = QUANT[mode_key]
+                load_4bit_str = ask("load student in 4-bit first? (faster, less VRAM)", default="y", options=["y", "n"])
+                load_4bit = load_4bit_str == "y"
+                print("\nexpert batch mode (for MoE):")
+                print("  [a] auto — fit as many experts as VRAM allows")
+                print("  [m] manual — choose batch size yourself")
+                batch_mode = ask("pick", default="a", options=["a", "m"])
+                manual_batch = None
+                if batch_mode == "m":
+                    manual_batch = int(ask("experts per batch", default="4"))
+                out_dir = ask("output directory", default=f"{model_id.split('/')[-1]}-{mode_name}")
+                dtype_str = ask("dtype", default="fp16", options=["fp16", "bf16"])
+                dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+        else:
+            print("ERROR: --model is required in non-interactive mode")
+            parser.print_help()
+            sys.exit(1)
+
+    # --- CLI args override preset/interactive values ---
     if args.teacher is not None:
         teacher_id = args.teacher
-    elif interactive:
-        teacher_id = ask("teacher model (HF name/path, or empty for PTQ)", default="")
-    else:
-        teacher_id = ""
-
     if args.mode:
         mode_name = "1bit" if args.mode == "1bit" else "ternary"
         quant_fn = onebit_weight if args.mode == "1bit" else ternary_weight
-    elif interactive:
-        print("\nquantization mode:")
-        print("  [1] 1bit    — binary {-1, +1}")
-        print("  [2] ternary — ternary {-1, 0, +1}")
-        mode_key = ask("pick", default="2", options=["1", "2"])
-        mode_name, quant_fn = QUANT[mode_key]
-    else:
-        mode_name, quant_fn = "ternary", ternary_weight
-
     if args.load_4bit is not None:
         load_4bit = args.load_4bit
-    elif interactive:
-        load_4bit_str = ask("load student in 4-bit first? (faster, less VRAM)", default="y", options=["y", "n"])
-        load_4bit = load_4bit_str == "y"
-    else:
-        load_4bit = False
-
     if args.expert_batch is not None:
         manual_batch = args.expert_batch
-    elif interactive:
-        print("\nexpert batch mode (for MoE):")
-        print("  [a] auto — fit as many experts as VRAM allows")
-        print("  [m] manual — choose batch size yourself")
-        batch_mode = ask("pick", default="a", options=["a", "m"])
-        manual_batch = None
-        if batch_mode == "m":
-            manual_batch = int(ask("experts per batch", default="4"))
-    else:
-        manual_batch = None
-
-    out_dir = args.output or (f"{model_id.split('/')[-1]}-{mode_name}" if model_id else "quantized")
-
+    if args.output:
+        out_dir = args.output
+    elif out_dir is None:
+        out_dir = f"{model_id.split('/')[-1]}-{mode_name}"
     if args.dtype:
         dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
-    elif interactive:
-        dtype_str = ask("dtype", default="fp16", options=["fp16", "bf16"])
-        dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
-    else:
-        dtype = torch.float16
 
     device = args.device or "cpu"
     calib_texts = None
