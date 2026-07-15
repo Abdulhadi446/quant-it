@@ -47,11 +47,16 @@ SKIP_NAMES = {"gate_proj", "router", "router_proj", "mlp.gate", "block_sparse_mo
 
 
 def is_moe(model):
+    has_gate = False
+    has_expert = False
     for name, mod in model.named_modules():
-        if any(k in name.lower() for k in ("gate_proj", "router", "mlp.gate", "block_sparse_moe")):
+        nl = name.lower()
+        if any(k in nl for k in ("gate_proj", "router", "mlp.gate", "block_sparse_moe")):
             if isinstance(mod, nn.Linear):
-                return True
-    return False
+                has_gate = True
+        if "expert" in nl:
+            has_expert = True
+    return has_gate and has_expert
 
 
 def should_skip(name):
@@ -584,7 +589,7 @@ def main():
             print(f"  {k:12s}  {v['model']}  ({v['mode']})")
         return
 
-    interactive = _is_interactive()
+    interactive = _is_interactive() and not args.preset
 
     print("=" * 60)
     print("  1-bit / ternary quantizer (Unsloth + dual T4)")
