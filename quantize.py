@@ -548,11 +548,12 @@ def load_with_unsloth(model_id, dtype, load_4bit, device_map="auto"):
             device_map=device_map,
             trust_remote_code=True,
             offload_folder="offload" if device_map == "auto" else None,
+            load_in_4bit=load_4bit,
         )
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         return model, tokenizer, False
 
-    # Try FastModel first (supports MoE), fall back to FastLanguageModel
+    # FastModel first (MoE support) — may force fp32 for some models
     try:
         model, tokenizer = FastModel.from_pretrained(
             model_name=model_id,
@@ -562,33 +563,65 @@ def load_with_unsloth(model_id, dtype, load_4bit, device_map="auto"):
             dtype=dtype,
             trust_remote_code=True,
         )
+        # check if it loaded in fp32 and would OOM — detect total param GB
+        total_gb = sum(p.numel() for p in model.parameters()) * 4 / (1024**3)
+        free_gb = get_total_free_vram_gb()
+        if total_gb > free_gb:
+            print(f"  FastModel forced fp32 ({total_gb:.0f} GB), OOM risk — "
+                  f"retrying with FastLanguageModel 4-bit...")
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
+            raise MemoryError("fp32 too large")
         return model, tokenizer, True
     except Exception:
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_id,
-            max_seq_length=4096,
-            load_in_4bit=load_4bit,
-            dtype=dtype,
-            trust_remote_code=True,
-        )
-        return model, tokenizer, True
+        # FastLanguageModel fallback — handles 4-bit better
+        try:
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_id,
+                max_seq_length=4096,
+                load_in_4bit=load_4bit,
+                dtype=dtype,
+                trust_remote_code=True,
+            )
+            return model, tokenizer, True
+        except Exception:
+            print("  unsloth loading failed, falling back to transformers 4-bit...")
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id, torch_dtype=dtype,
+                device_map=device_map,
+                trust_remote_code=True,
+                load_in_4bit=True,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+            return model, tokenizer, False
 
 
-def load_teacher_unsloth(model_id, dtype):
-    """Load teacher model — fp16, no 4-bit, auto device_map for 2x T4."""
+def load_teacher_unsloth(model_id, dtype, load_4bit=False):
+    """Load teacher model — tries fp16 first, falls back to 4-bit if OOM."""
     try:
         from unsloth import FastLanguageModel, FastModel
         try:
             model, tok = FastModel.from_pretrained(
                 model_name=model_id, max_seq_length=4096,
-                load_in_4bit=False, dtype=dtype,
+                load_in_4bit=load_4bit, dtype=dtype,
                 trust_remote_code=True,
             )
+            # check for fp32 OOM
+            total_gb = sum(p.numel() for p in model.parameters()) * 4 / (1024**3)
+            free_gb = get_total_free_vram_gb()
+            if total_gb > free_gb:
+                print(f"  teacher fp32 ({total_gb:.0f} GB) too large, retrying 4-bit...")
+                del model
+                gc.collect()
+                torch.cuda.empty_cache()
+                return load_teacher_unsloth(model_id, dtype, load_4bit=True)
             return model, tok
         except Exception:
             model, tok = FastLanguageModel.from_pretrained(
                 model_name=model_id, max_seq_length=4096,
-                load_in_4bit=False, dtype=dtype,
+                load_in_4bit=load_4bit, dtype=dtype,
                 trust_remote_code=True,
             )
             return model, tok
@@ -596,7 +629,7 @@ def load_teacher_unsloth(model_id, dtype):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         model = AutoModelForCausalLM.from_pretrained(
             model_id, torch_dtype=dtype, device_map="auto",
-            trust_remote_code=True,
+            trust_remote_code=True, load_in_4bit=load_4bit,
         )
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         return model, tok
@@ -674,7 +707,7 @@ PRESETS = {
         "model": "Qwen/Qwen3-30B-A3B",
         "teacher": "Qwen/Qwen3-30B-A3B",
         "mode": "ternary",
-        "load_4bit": False,
+        "load_4bit": True,
         "dtype": "fp16",
         "expert_batch": None,
     },
