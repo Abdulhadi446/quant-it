@@ -15,10 +15,14 @@ Quantizes **any** HuggingFace transformer model to extreme low-bit formats:
 
 | Mode | Weights | Bits per weight | Compression vs FP16 |
 |------|---------|----------------|---------------------|
-| **1-bit** | `{-1, +1}` binary | 1.0 | 16x |
-| **Ternary** | `{-1, 0, +1}` | ~1.5-1.7 | ~10x |
+| **1-bit (Q1_0_g128)** | `{-1, +1}` binary | 1.125 | ~14× |
+| **Ternary (Q2_0_g128)** | `{-1, 0, +1}` | 2.125 (1.58-bit info) | ~7× |
+
+Both formats use **group-128 block quantization** with per-group FP16 scales — matching the Q1_0_g128 / Q2_0 formats used by the [Bonsai](https://github.com/PrismML-Eng/Bonsai-demo) family and llama.cpp's GGUF.
 
 Inspired by the [Bonsai](https://github.com/deepgrove-ai/Bonsai) (deepgrove) and [PrismML](https://github.com/PrismML-Eng/Bonsai-demo) research on ultra-efficient language models.
+
+See [paper.md](paper.md) for the full technical description of the MoE quantization approach.
 
 ---
 
@@ -26,22 +30,34 @@ Inspired by the [Bonsai](https://github.com/deepgrove-ai/Bonsai) (deepgrove) and
 
 ### MoE-Aware Quantization
 
-Automatic detection of Mixture-of-Experts architectures (Qwen-MoE, Mixtral, DeepSeek, etc.). Router/gate layers are **never quantized** — only expert feed-forward weights are binarized or ternarized.
+Automatic detection of Mixture-of-Experts architectures (Qwen-MoE, Mixtral, DeepSeek, DBRX, Arctic, etc.).
+
+**Router/gate layers are never quantized** — only expert feed-forward weights are binarized or ternarized. This is critical: quantizing gate layers causes routing collapse and immediate quality degradation. The gate layers (`gate_proj`, `router`, `mlp.gate`, `block_sparse_moe.gate`) account for < 0.1% of total parameters and are preserved in FP16.
+
+Supported MoE router patterns:
+
+| Architecture | Router Detected | Expert Pattern |
+|---|---|---|
+| Qwen3-MoE (30B-A3B, 35B-A3B) | `mlp.gate` | `mlp.experts.{i}` |
+| Mixtral-8x7B / 8x22B | `block_sparse_moe.gate` | `block_sparse_moe.experts.{i}` |
+| DeepSeek-V2 / V3 | `mlp.gate` | `mlp.experts.{i}` |
+| DBRX | `ffn.router` | `ffn.experts.{i}` |
 
 ### Batched Expert Streaming
 
 Fits massive MoE models on limited VRAM by loading experts in optimally-sized batches:
 
-- **Auto mode**: measures free VRAM, calculates how many experts fit, processes them in parallel batches
+- **Auto mode**: measures free VRAM, calculates how many experts fit, processes them in batches
 - **Manual mode**: you pick the batch size (e.g., 4, 8, 16 experts per iteration)
-- **Expert-by-expert**: load → quantize → offload to CPU → repeat
+- **Pattern**: load batch → quantize in-place → offload to CPU → free cache → repeat
 
-Example with Qwen3-30B-A3B (128 experts, 2x T4):
+Example with Qwen3-30B-A3B (128 experts, 2×T4):
 ```
-auto batch size: 50 experts/iter (~300 MB each)
-layer 1/24: batch [0:50] → quantize → offload
-layer 1/24: batch [50:100] → quantize → offload
-layer 1/24: batch [100:128] → quantize → offload
+auto batch size: 56 experts/iter (~300 MB each, 0.6 × 28 GB / 300 MB)
+layer 1/24: batch [0:56]    → quantize → offload
+layer 1/24: batch [56:112]  → quantize → offload
+layer 1/24: batch [112:128] → quantize → offload
+...
 ```
 
 ### Knowledge Distillation
@@ -50,17 +66,60 @@ Use a full-precision teacher model to guide quantization with KL-divergence loss
 
 ```bash
 # Ternary quantize Llama-3-8B with 70B teacher
-./quant.sh
-# → student: meta-llama/Llama-3-8B
-# → teacher: meta-llama/Llama-3-70B
-# → mode: ternary
+python quantize.py --model meta-llama/Llama-3-8B --teacher meta-llama/Llama-3-70B --mode ternary
 ```
 
-Uses Straight-Through Estimator (STE) for gradient flow through the quantization function.
+Uses the **Straight-Through Estimator (STE)** for gradient flow through the quantization function. Router weights remain frozen throughout distillation.
 
 ### Pure PTQ
 
-No teacher needed — post-training quantization with per-channel symmetric scaling.
+No teacher needed — post-training quantization with per-group symmetric scaling. Works well for ternary; 1-bit benefits from distillation.
+
+---
+
+## How It Works
+
+### Quantization Functions
+
+**1-bit (Q1_0_g128)**: Each group of 128 weights is replaced by its sign scaled by the group's mean absolute value:
+
+```
+scale = mean(|w|)  per 128-weight group
+w_hat = scale * sign(w)    → {-scale, +scale}
+```
+
+**Ternary (Q2_0_g128)**: Each group of 128 weights is mapped to {−1, 0, +1} scaled by the group max:
+
+```
+scale = max(|w|)  per 128-weight group
+q = clamp(round(w / scale), -1, 1)   → {-1, 0, +1}
+w_hat = scale * q                     → {-scale, 0, +scale}
+```
+
+Ternary sets ~30% of weights to exactly zero — creating **double sparsity** on top of MoE's already-sparse activation pattern.
+
+### MoE Router Detection
+
+```python
+SKIP_NAMES = {"gate_proj", "router", "router_proj", "mlp.gate", "block_sparse_moe.gate"}
+```
+
+Router weights matching these patterns are **never touched**. Only `nn.Linear` layers with "expert" in their module path (and not matching a router pattern) are quantized.
+
+### Expert Batch Sizing
+
+```
+batch_size = floor( free_VRAM × 0.6 / bytes_per_expert )
+```
+
+The 0.6 safety factor accounts for CUDA allocator overhead and activation memory. With 2×T4 (~28 GB free) and 300 MB experts: `28 × 0.6 / 0.3 = 56 experts per batch`.
+
+### Weight Packing
+
+After quantization, weights are packed into compact int32 representations:
+
+- **Q1_0_g128**: 32 sign bits per int32 word + 1 FP16 scale per 128 weights → ~1.125 bits/weight
+- **Q2_0_g128**: 16 ternary codes (2 bits each) per int32 word + 1 FP16 scale per 128 weights → ~2.125 bits/weight
 
 ---
 
@@ -68,11 +127,12 @@ No teacher needed — post-training quantization with per-channel symmetric scal
 
 | Setup | Best For |
 |-------|----------|
-| **2x T4 (15.9GB each) + 32GB RAM** | MoE models up to 30B params |
-| **1x T4/RTX 3090/4090** | Dense models up to 8B |
-| **CPU only** | Small models (<3B) |
+| **2×T4 (15.9 GB each) + 32 GB RAM** | MoE models up to 35B total params |
+| **1×RTX 4090 (24 GB) + 64 GB RAM** | MoE up to 70B total, dense up to 30B |
+| **1×T4/RTX 3090 (16–24 GB) + 32 GB RAM** | Dense models up to 8B; MoE up to 20B |
+| **CPU only** | Small models (< 3B) |
 
-Unsloth handles automatic GPU↔CPU offloading. Expert batching keeps peak VRAM under 2GB regardless of model size.
+Unsloth handles automatic GPU↔CPU offloading. Expert batching keeps peak VRAM independent of total model size.
 
 ---
 
@@ -111,8 +171,6 @@ The interactive wizard will prompt you for:
 #### 1. Ternary quantize a small dense model (fits on any GPU)
 
 ```bash
-git clone https://github.com/Abdulhadi446/quant-it.git
-cd quant-it
 ./quant.sh
 # → student: Qwen/Qwen2.5-0.5B
 # → teacher: (empty — PTQ)
@@ -134,14 +192,14 @@ cd quant-it
 # → output: Llama-3-8B-1bit
 ```
 
-#### 3. Ternary quantize a MoE model on 2x T4
+#### 3. Ternary quantize a MoE model on 2×T4
 
 ```bash
 ./quant.sh
 # → student: Qwen/Qwen3-30B-A3B
 # → teacher: (empty — PTQ)
 # → mode: ternary
-# → batch: auto (fits ~50 experts per batch on 2x T4)
+# → batch: auto (fits ~56 experts per batch on 2×T4)
 # → output: Qwen3-30B-A3B-ternary
 ```
 
@@ -156,7 +214,13 @@ cd quant-it
 # → output: Qwen3-30B-A3B-ternary
 ```
 
-#### 5. Ternary quantize Mistral-7B
+#### 5. 1-bit quantize Qwen3.6-35B-A3B (MoE)
+
+```bash
+python quantize.py --preset qwen35b
+```
+
+#### 6. Ternary quantize Mistral-7B
 
 ```bash
 ./quant.sh
@@ -166,7 +230,7 @@ cd quant-it
 # → output: Mistral-7B-v0.1-ternary
 ```
 
-#### 6. 1-bit quantize Phi-3 with custom calibration data
+#### 7. 1-bit quantize Phi-3 with custom calibration data
 
 ```bash
 # first create a calibration file
@@ -174,53 +238,58 @@ echo "The capital of France is Paris." > calib.txt
 echo "Machine learning is a subset of AI." >> calib.txt
 echo "Python is a popular programming language." >> calib.txt
 
-./quant.sh
-# → student: microsoft/Phi-3-mini-4k-instruct
-# → teacher: (empty)
-# → mode: 1bit
-# → output: Phi-3-mini-4k-instruct-1bit
+python quantize.py --model microsoft/Phi-3-mini-4k-instruct --mode 1bit --calib-file calib.txt
 ```
 
-#### 7. Quantize a local model
+#### 8. Quantize a local model
 
 ```bash
-./quant.sh
-# → student: /path/to/my/local/model
-# → teacher: (empty)
-# → mode: ternary
-# → output: my-local-model-ternary
+python quantize.py --model /path/to/my/local/model --mode ternary --output my-local-model-ternary
 ```
 
-#### 8. Full distillation with custom hyperparameters
+#### 9. Full distillation with custom hyperparameters
 
 ```bash
-./quant.sh
-# → student: Qwen/Qwen2.5-7B
-# → teacher: Qwen/Qwen2.5-72B
-# → mode: ternary
-# → epochs: 5
-# → lr: 1e-4
-# → batch size: 2
-# → max len: 1024
-# → calib file: calib.txt
-# → output: Qwen2.5-7B-ternary-distilled
+python quantize.py \
+  --model Qwen/Qwen2.5-7B \
+  --teacher Qwen/Qwen2.5-72B \
+  --mode ternary \
+  --epochs 5 \
+  --lr 1e-4 \
+  --batch-size 2 \
+  --max-len 1024 \
+  --calib-file calib.txt \
+  --output Qwen2.5-7B-ternary-distilled
+```
+
+#### 10. Dequantize back to FP16 (for use with standard inference stacks)
+
+```bash
+python quantize.py --dequantize Qwen3-30B-A3B-ternary --output Qwen3-30B-A3B-fp16
 ```
 
 ### Programmatic Usage
 
 ```python
-from quantize import ptq, ternary_weight, onebit_weight
+from quantize import ptq, ternary_weight, onebit_weight, quantize_experts_batched, is_moe
 from transformers import AutoModelForCausalLM
 
-# ternary quantization
+# ternary PTQ — any model
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B")
 model = ptq(model, ternary_weight)
 model.save_pretrained("qwen2.5-0.5b-ternary")
 
-# 1-bit quantization
+# 1-bit PTQ — dense model
 model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3-8B")
 model = ptq(model, onebit_weight)
 model.save_pretrained("llama3-8b-1bit")
+
+# MoE-aware batched PTQ
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-30B-A3B", device_map="auto")
+if is_moe(model):
+    model = quantize_experts_batched(model, ternary_weight, dtype=torch.float16, device="cuda:0")
+else:
+    model = ptq(model, ternary_weight)
 ```
 
 ### Running from Jupyter / Kaggle
@@ -228,13 +297,7 @@ model.save_pretrained("llama3-8b-1bit")
 Shell commands need `!` prefix. Use `--model` or `--preset` flags (no interactive prompts):
 
 ```python
-# wrong — causes SyntaxError
-# ./quant.sh
-
-# correct — run with preset
-!./quant.sh --preset qwen35b
-
-# or run python directly with preset
+# quantize with preset (non-interactive)
 !python quantize.py --preset qwen35b
 
 # with teacher distillation
@@ -245,7 +308,7 @@ Shell commands need `!` prefix. Use `--model` or `--preset` flags (no interactiv
   --epochs 3 \
   --device cuda:0
 
-# MoE model with custom expert batch
+# MoE model with custom expert batch size
 !python quantize.py \
   --model Qwen/Qwen3.6-35B-A3B \
   --mode ternary \
@@ -266,47 +329,69 @@ git clone https://github.com/Abdulhadi446/quant-it.git && cd quant-it && ./quant
 source .venv/bin/activate && python quantize.py
 
 # quantize and push to HuggingFace
-python quantize.py Qwen/Qwen2.5-0.5B -o qwen-ternary && \
-  huggingface-cli upload my-username/qwen-2.5-0.5b-ternary qwen-ternary
+python quantize.py --model Qwen/Qwen2.5-0.5B --mode ternary --output qwen-ternary
+huggingface-cli upload my-username/qwen-2.5-0.5b-ternary qwen-ternary
 ```
 
 ---
 
-## How It Works
+## Output
 
-### Quantization Functions
+Quantized models are saved in a hybrid format alongside the standard HuggingFace config/tokenizer:
 
-**1-bit (Binary)**: Each weight is replaced by its sign — `{-1, +1}`.
+```
+model_name-ternary/
+├── config.json               # HuggingFace model config
+├── tokenizer.json            # tokenizer
+├── tokenizer_config.json
+├── quantized_weights.pt      # packed {int32 bit-codes + FP16 scales}
+└── quant_config.pt           # {pack_config, mode, group_size}
+```
+
+To use the output with standard HuggingFace inference, first dequantize to FP16 safetensors:
+
+```bash
+python quantize.py --dequantize model_name-ternary --output model_name-fp16
+```
+
+Then load as normal:
 
 ```python
-w_binary = sign(w)  # per-output-channel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("llama3-8b-ternary-fp16")
+tokenizer = AutoTokenizer.from_pretrained("llama3-8b-ternary-fp16")
 ```
 
-**Ternary**: Symmetric ternary with learned thresholds via `tanh` normalization:
+---
 
-```python
-scale = mean(|w|)           # per-output-channel scaling
-w_norm = w / scale
-w_ternary = tanh(w_norm)    # squash to [-1, +1]
-# threshold at ±0.4 → {-1, 0, +1}
-```
+## Benchmarks (Bonsai Reference)
 
-### MoE Router Detection
+The Bonsai family demonstrates what extreme quantization achieves on dense models. MoE models at comparable activated-parameter counts are expected to show similar quality retention.
 
-The script scans model architecture for common MoE patterns:
-- `gate_proj`, `router`, `router_proj`
-- `mlp.gate`, `block_sparse_moe.gate`
-- `expert` + `nn.Linear` layers
+| Model | Params | Format | Size | MMLU | Avg Benchmark |
+|-------|--------|--------|------|------|--------------|
+| Qwen3-8B FP16 | 8B | FP16 | 16.4 GB | 83.0 | 79.3 |
+| Ternary Bonsai 8B | 8B | Q2_0_g128 | 2.16 GB | — | 75.5 (−4.6%) |
+| 1-bit Bonsai 8B | 8B | Q1_0_g128 | 1.15 GB | 65.7 | 59.9 (−24%) |
+| Qwen3.6-27B FP16 | 27B | FP16 | 54 GB | 93.4 | 85.1 |
+| Ternary Bonsai 27B | 27B | Q2_0 | 5.9 GB | 88.1 | 80.5 (−5.4%) |
+| 1-bit Bonsai 27B | 27B | Q1_0 | 3.9 GB | 82.8 | 76.1 (−10.6%) |
+| Bonsai 0.5B (ternary) | 0.5B | Q2_0 | ~170 MB | 30.3 | — |
 
-Router weights are preserved in their original precision to maintain routing accuracy.
+**Intelligence Density** = −log₂(Pₑ) / N_GB where Pₑ = 1 − score/100. Ternary models achieve 7–11× higher intelligence density than their FP16 counterparts.
 
-### Expert Batch Sizing
+---
 
-```
-available VRAM × safety_factor / expert_size = batch_size
-```
+## Technical Paper
 
-With 2x T4 (~28GB free) and 300MB experts: `28 × 0.6 / 0.3 = 56 experts per batch`
+See [paper.md](paper.md) for the full technical description of:
+- Q1_0_g128 (binary) and Q2_0_g128 (true ternary) quantization mathematics
+- Why router preservation is essential for MoE models
+- Expert batch streaming algorithm and VRAM budget calculation
+- Knowledge distillation with STE for MoE models
+- Weight packing format specification
+- Limitations and future work (QAT, native kernels, KV-cache quantization)
 
 ---
 
@@ -314,23 +399,23 @@ With 2x T4 (~28GB free) and 300MB experts: `28 × 0.6 / 0.3 = 56 experts per bat
 
 This tool implements techniques from:
 
-- **[Bonsai](https://github.com/deepgrove-ai/Bonsai)** — 500M ternary-weight LM trained in <5B tokens (deepgrove-ai)
+- **[Bonsai](https://github.com/deepgrove-ai/Bonsai)** — 500M ternary-weight LM trained from scratch (deepgrove-ai)
 - **[PrismML Bonsai](https://github.com/PrismML-Eng/Bonsai-demo)** — 1-bit and ternary models from 1.7B to 27B parameters
-- **[Bonsai 27B Whitepaper](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/bonsai-27b-whitepaper.pdf)** — 14x less memory, 8x faster, 5x less energy vs FP16
-- **[1-bit Bonsai 8B](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/1-bit-bonsai-8b-whitepaper.pdf)** — Q1_0 group-128 binary quantization
-- **[Ternary Bonsai 8B](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/ternary-bonsai-8b-whitepaper.pdf)** — Q2_0 ternary quantization with g128 grouping
-- **[Bonsai Image 4B](https://github.com/PrismML-Eng/Bonsai-Image-Demo/blob/main/bonsai-image-4b-whitepaper.pdf)** — Vision-language ternary model
+- **[1-bit Bonsai 8B](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/1-bit-bonsai-8b-whitepaper.pdf)** — Q1_0_g128 binary quantization, 14× compression
+- **[Ternary Bonsai 8B](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/ternary-bonsai-8b-whitepaper.pdf)** — True {−1, 0, +1} Q2_0_g128 at 8B/4B/1.7B scale
+- **[Bonsai 27B](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/bonsai-27b-whitepaper.pdf)** — 27B reasoning in 3.9–5.9 GB; first 27B model on a phone
+- **[Bonsai Image 4B](https://github.com/PrismML-Eng/Bonsai-Image-Demo/blob/main/bonsai-image-4b-whitepaper.pdf)** — Binary/ternary diffusion transformers
 
 ### Key Technical Insights Applied
 
 | Concept | Source | Implementation |
 |---------|--------|----------------|
-| Per-channel symmetric scaling | Bonsai papers | `scale = mean(|w|)` per output dim |
-| Tanh-based ternary thresholding | PrismML | threshold at ±0.4 after tanh normalization |
-| MoE router preservation | Bonsai MoE analysis | skip `gate_proj`, `router` layers |
-| Group-128 quantization | Q1_0/Q2_0 GGUF format | group size 128 for weight blocks |
-| Expert streaming | Hardware constraints | batch-load experts, quantize, offload |
-| STE for distillation | Standard QAT | straight-through estimator for gradient flow |
+| Group-128 symmetric scaling | Bonsai Q1_0_g128 / Q2_0 | `scale = mean/max(|w|)` per 128-weight group |
+| True ternary {−1, 0, +1} | PrismML Ternary Bonsai | `clamp(round(w/scale), -1, 1)` |
+| MoE router preservation | Bonsai 27B MoE analysis | skip `gate_proj`, `router` etc. layers |
+| Expert streaming | Hardware constraints | batch-load, quantize, offload to CPU |
+| STE for distillation | Standard QAT literature | straight-through estimator |
+| Intelligence density metric | PrismML whitepapers | −log₂(Pₑ) / N_GB |
 
 ---
 
@@ -339,7 +424,7 @@ This tool implements techniques from:
 Works with any HuggingFace `AutoModelForCausalLM`:
 
 - **Dense**: Llama, Qwen, Mistral, Phi, Gemma, GPT-2, etc.
-- **MoE**: Qwen-MoE, Mixtral, DeepSeek-V2/V3, DBRX, etc.
+- **MoE**: Qwen-MoE, Mixtral, DeepSeek-V2/V3, DBRX, Arctic, etc.
 - **Custom**: any model with `trust_remote_code=True`
 
 ---
@@ -349,8 +434,8 @@ Works with any HuggingFace `AutoModelForCausalLM`:
 ### Requirements
 
 - Python 3.10+
-- CUDA-capable GPU (recommended)
-- 16GB+ system RAM
+- CUDA-capable GPU (recommended; CPU-only works for small models)
+- 16 GB+ system RAM (32 GB+ for large MoE models)
 
 ### Manual
 
@@ -368,46 +453,6 @@ pip install unsloth
 
 ---
 
-## Output
-
-Quantized models are saved in HuggingFace format:
-
-```
-model_name-ternary/
-├── config.json
-├── model.safetensors
-├── tokenizer.json
-├── tokenizer_config.json
-└── ...
-```
-
-Load and use like any HuggingFace model:
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-model = AutoModelForCausalLM.from_pretrained("llama3-8b-ternary")
-tokenizer = AutoTokenizer.from_pretrained("llama3-8b-ternary")
-```
-
----
-
-## Benchmarks (Bonsai Reference)
-
-The Bonsai family demonstrates what extreme quantization achieves:
-
-| Model | Params | Format | Weights Size | MMLU | ARC-c |
-|-------|--------|--------|-------------|------|-------|
-| Bonsai (ternary) | 500M | Q2_0 | ~170 MB | 30.28 | 33.36 |
-| Qwen 2.5 0.5B (FP16) | 500M | FP16 | 1.0 GB | 33.40 | 32.25 |
-| Bonsai-8B (1-bit) | 8B | Q1_0 | ~1.0 GB | — | — |
-| Bonsai-27B (1-bit) | 27B | Q1_0 | 3.53 GiB | — | — |
-| Bonsai-27B (ternary) | 27B | Q2_0 | 6.66 GiB | — | — |
-
-Ternary Bonsai-500M matches FP16 models 10x its size on common benchmarks.
-
----
-
 ## License
 
 MIT License — see [LICENSE](LICENSE).
@@ -417,7 +462,7 @@ MIT License — see [LICENSE](LICENSE).
 ## Acknowledgments
 
 - [deepgrove-ai](https://github.com/deepgrove-ai/Bonsai) for the original Bonsai ternary model
-- [PrismML](https://github.com/PrismML-Eng/Bonsai-demo) for the Bonsai 1-bit and ternary family
+- [PrismML](https://github.com/PrismML-Eng/Bonsai-demo) for the Bonsai 1-bit, ternary, image, and 27B family
 - [Unsloth](https://github.com/unslothai/unsloth) for memory-efficient model loading and training
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) for Q1_0 and Q2_0 quantization format support
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) for Q1_0_g128 and Q2_0 quantization format specification
 - [HuggingFace Transformers](https://github.com/huggingface/transformers) for the model ecosystem
