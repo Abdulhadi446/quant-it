@@ -221,19 +221,34 @@ model = ptq(model, onebit_weight)
 model.save_pretrained("llama3-8b-1bit")
 ```
 
-### Running from Jupyter / IPython
+### Running from Jupyter / Kaggle
 
-Shell commands need `!` prefix in Jupyter:
+Shell commands need `!` prefix. Use `--model` flag (no interactive prompts):
 
 ```python
 # wrong — causes SyntaxError
 # ./quant.sh
 
-# correct
-!./quant.sh
+# correct — run from terminal
+!./quant.sh --model Qwen/Qwen2.5-0.5B
 
-# or run the Python script directly
-!python quantize.py
+# or run python directly with CLI args
+!python quantize.py --model Qwen/Qwen2.5-0.5B --mode ternary
+
+# with teacher distillation
+!python quantize.py \
+  --model meta-llama/Llama-3-8B \
+  --teacher meta-llama/Llama-3-70B \
+  --mode ternary \
+  --epochs 3 \
+  --device cuda:0
+
+# MoE model with custom expert batch
+!python quantize.py \
+  --model Qwen/Qwen3-30B-A3B \
+  --mode ternary \
+  --expert-batch 8 \
+  --output qwen3-moe-ternary
 ```
 
 ### One-Liner Examples

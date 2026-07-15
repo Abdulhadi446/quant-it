@@ -5,6 +5,7 @@ Optimized for 2x T4 (15.9GB each) + 32GB CPU RAM.
 Auto-detects MoE, skips router layers, batched expert-by-expert streaming.
 """
 
+import argparse
 import gc
 import os
 import sys
@@ -494,52 +495,115 @@ def hardware_check(load_4bit):
 # main
 # ---------------------------------------------------------------------------
 
+def _is_interactive():
+    """Check if we can use input() (not in Jupyter/Kaggle/non-TTY)."""
+    import sys
+    return sys.stdin.isatty() if hasattr(sys.stdin, 'isatty') else False
+
+
 def main():
+    parser = argparse.ArgumentParser(description="1-bit / ternary quantizer")
+    parser.add_argument("--model", "-m", default=None, help="student model (HF name or path)")
+    parser.add_argument("--teacher", "-t", default=None, help="teacher model (enables distillation)")
+    parser.add_argument("--mode", choices=["1bit", "ternary"], default=None, help="quantization mode")
+    parser.add_argument("--output", "-o", default=None, help="output directory")
+    parser.add_argument("--dtype", choices=["fp16", "bf16"], default=None)
+    parser.add_argument("--load-4bit", action="store_true", default=None, help="load student in 4-bit")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--batch-size", type=int, default=None, help="distillation batch size")
+    parser.add_argument("--max-len", type=int, default=None)
+    parser.add_argument("--calib-file", default=None, help="calibration text file")
+    parser.add_argument("--device", default=None, help="device (cuda:0, cpu, etc)")
+    parser.add_argument("--expert-batch", type=int, default=None, help="MoE experts per batch")
+    args, _ = parser.parse_known_args()
+
+    interactive = _is_interactive()
+
     print("=" * 60)
     print("  1-bit / ternary quantizer (Unsloth + dual T4)")
     print("=" * 60)
 
-    model_id = ask("\nstudent model (HF name or local path)")
-    teacher_id = ask("teacher model (HF name/path, or empty for PTQ)", default="")
+    # --- collect settings (CLI args or interactive) ---
+    if args.model:
+        model_id = args.model
+    elif interactive:
+        model_id = ask("\nstudent model (HF name or local path)")
+    else:
+        print("ERROR: --model is required in non-interactive mode")
+        parser.print_help()
+        sys.exit(1)
 
-    print("\nquantization mode:")
-    print("  [1] 1bit    — binary {-1, +1}")
-    print("  [2] ternary — ternary {-1, 0, +1}")
-    mode_key = ask("pick", default="2", options=["1", "2"])
-    mode_name, quant_fn = QUANT[mode_key]
+    if args.teacher is not None:
+        teacher_id = args.teacher
+    elif interactive:
+        teacher_id = ask("teacher model (HF name/path, or empty for PTQ)", default="")
+    else:
+        teacher_id = ""
 
-    load_4bit_str = ask("load student in 4-bit first? (faster, less VRAM)", default="y", options=["y", "n"])
-    load_4bit = load_4bit_str == "y"
+    if args.mode:
+        mode_name = "1bit" if args.mode == "1bit" else "ternary"
+        quant_fn = onebit_weight if args.mode == "1bit" else ternary_weight
+    elif interactive:
+        print("\nquantization mode:")
+        print("  [1] 1bit    — binary {-1, +1}")
+        print("  [2] ternary — ternary {-1, 0, +1}")
+        mode_key = ask("pick", default="2", options=["1", "2"])
+        mode_name, quant_fn = QUANT[mode_key]
+    else:
+        mode_name, quant_fn = "ternary", ternary_weight
 
-    print("\nexpert batch mode (for MoE):")
-    print("  [a] auto — fit as many experts as VRAM allows")
-    print("  [m] manual — choose batch size yourself")
-    batch_mode = ask("pick", default="a", options=["a", "m"])
+    if args.load_4bit is not None:
+        load_4bit = args.load_4bit
+    elif interactive:
+        load_4bit_str = ask("load student in 4-bit first? (faster, less VRAM)", default="y", options=["y", "n"])
+        load_4bit = load_4bit_str == "y"
+    else:
+        load_4bit = False
 
-    manual_batch = None
-    if batch_mode == "m":
-        manual_batch = int(ask("experts per batch", default="4"))
+    if args.expert_batch is not None:
+        manual_batch = args.expert_batch
+    elif interactive:
+        print("\nexpert batch mode (for MoE):")
+        print("  [a] auto — fit as many experts as VRAM allows")
+        print("  [m] manual — choose batch size yourself")
+        batch_mode = ask("pick", default="a", options=["a", "m"])
+        manual_batch = None
+        if batch_mode == "m":
+            manual_batch = int(ask("experts per batch", default="4"))
+    else:
+        manual_batch = None
 
-    out_dir = ask("output directory", default=f"{model_id.split('/')[-1]}-{mode_name}")
-    dtype_str = ask("dtype", default="fp16", options=["fp16", "bf16"])
-    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+    out_dir = args.output or (f"{model_id.split('/')[-1]}-{mode_name}" if model_id else "quantized")
 
-    device = "cpu"
+    if args.dtype:
+        dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
+    elif interactive:
+        dtype_str = ask("dtype", default="fp16", options=["fp16", "bf16"])
+        dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype_str]
+    else:
+        dtype = torch.float16
+
+    device = args.device or "cpu"
     calib_texts = None
-    epochs = 3
-    lr = 5e-4
-    batch_size = 1
-    max_len = 512
+    epochs = args.epochs or 3
+    lr = args.lr or 5e-4
+    batch_size = args.batch_size or 1
+    max_len = args.max_len or 512
 
     if teacher_id:
-        print("\n--- distillation settings ---")
-        device = pick_device()
-        epochs = int(ask("epochs", default="3"))
-        lr = float(ask("learning rate", default="5e-4"))
-        batch_size = int(ask("batch size", default="1"))
-        max_len = int(ask("max sequence length", default="512"))
+        if interactive and not args.device:
+            print("\n--- distillation settings ---")
+            device = pick_device()
+            epochs = int(ask("epochs", default=str(epochs)))
+            lr = float(ask("learning rate", default=str(lr)))
+            batch_size = int(ask("batch size", default=str(batch_size)))
+            max_len = int(ask("max sequence length", default=str(max_len)))
 
-        calib_path = ask("calib file (one sentence/line, or empty for dummy)", default="")
+        calib_path = args.calib_file
+        if interactive and not calib_path:
+            calib_path = ask("calib file (one sentence/line, or empty for dummy)", default="")
+
         if calib_path and os.path.isfile(calib_path):
             calib_texts = Path(calib_path).read_text().strip().splitlines()
             print(f"  loaded {len(calib_texts)} calibration lines")
@@ -561,7 +625,6 @@ def main():
         total_experts = sum(len(g["expert_modules"]) for g in groups)
         print(f"  found {total_experts} experts across {len(groups)} layers")
 
-        # show auto batch size estimate
         auto_bs, expert_bytes = calc_batch_size(groups, dtype)
         print(f"  auto batch size: {auto_bs} experts/iter (~{expert_bytes/(1024**2):.1f} MB each)")
 
@@ -573,7 +636,8 @@ def main():
                           calib_texts, epochs, batch_size, lr, max_len, device)
     elif moe_flag:
         print("running expert-batched PTQ...")
-        device = pick_device() if torch.cuda.is_available() else "cpu"
+        if device == "cpu" and torch.cuda.is_available():
+            device = pick_device() if interactive else "cuda:0"
         student = quantize_experts_batched(
             student, quant_fn, dtype,
             batch_size=manual_batch,
