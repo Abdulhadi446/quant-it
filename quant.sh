@@ -19,7 +19,11 @@ PYTHON="$(command -v python3)"
 # --- venv ---
 if [ ! -d ".venv" ]; then
     echo "[1/4] creating virtual environment..."
-    "$PYTHON" -m venv .venv
+    "$PYTHON" -m venv .venv --without-pip 2>/dev/null || "$PYTHON" -m venv .venv
+    # bootstrap pip if ensurepip was skipped
+    if [ ! -f ".venv/bin/pip" ]; then
+        curl -sS https://bootstrap.pypa.io/get-pip.py | .venv/bin/python3
+    fi
 else
     echo "[1/4] venv already exists"
 fi
