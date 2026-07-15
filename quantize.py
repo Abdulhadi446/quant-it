@@ -665,7 +665,7 @@ PRESETS = {
         "model": "Qwen/Qwen3.6-35B-A3B",
         "teacher": "Qwen/Qwen3.6-35B-A3B",
         "mode": "ternary",
-        "load_4bit": False,
+        "load_4bit": True,
         "dtype": "fp16",
         "expert_batch": None,
     },
