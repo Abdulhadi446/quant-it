@@ -21,9 +21,10 @@ from torch.utils.data import DataLoader, Dataset
 # quantization primitives — block-based (Bonsai Q1_0 / Q2_0 style)
 # ---------------------------------------------------------------------------
 
-def quant_q1_0(tensor, group_size=32):
-    """Q1_0: 1-bit block quantization.
+def quant_q1_0(tensor, group_size=128):
+    """Q1_0_g128: 1-bit block quantization with group size 128 (matches Bonsai Q1_0_g128).
        scale = mean(|w|) per block, sign encodes the bit.
+       weights -> {-scale, +scale} within each group.
        In-place. Returns quantized tensor.
     """
     w = tensor.float()
@@ -35,7 +36,7 @@ def quant_q1_0(tensor, group_size=32):
         flat = F.pad(flat, (0, pad))
     blocks = flat.view(-1, group_size)
     scales = blocks.abs().mean(dim=1, keepdim=True).clamp(min=1e-8)
-    bits = (blocks >= 0).to(flat.dtype) * 2 - 1
+    bits = (blocks >= 0).to(flat.dtype) * 2 - 1  # {0,1} -> {-1,+1}
     quantized = bits * scales
     if pad:
         quantized = quantized.view(-1)[:n]
@@ -44,10 +45,11 @@ def quant_q1_0(tensor, group_size=32):
 
 
 def quant_q2_0(tensor, group_size=128):
-    """Q2_0: ternary block quantization (4 values).
-       scale = max(|w|) per block.
-       q = round(w/d) + 1, clamped [0,3].
-       decode: (q-1)*d → {-d, 0, +d, +2d}.
+    """True ternary block quantization: weights -> {-1, 0, +1} * scale.
+       scale = max(|w|) per block (g128, matches Bonsai Q2_0 / 1.58-bit).
+       q_raw = round(w / scale) clamped to {-1, 0, +1}.
+       stored code = q_raw + 1  -> {0, 1, 2}  (2 bits per weight).
+       decode: (code - 1) * scale -> {-scale, 0, +scale}.
        In-place. Returns quantized tensor.
     """
     w = tensor.float()
@@ -59,9 +61,8 @@ def quant_q2_0(tensor, group_size=128):
         flat = F.pad(flat, (0, pad))
     blocks = flat.view(-1, group_size)
     scales = blocks.abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
-    q = (blocks / scales).round().to(torch.int32) + 1
-    q = q.clamp(0, 3)
-    decoded = (q.float() - 1) * scales
+    q = (blocks / scales).round().to(torch.int32).clamp(-1, 1)  # {-1, 0, +1}
+    decoded = q.float() * scales
     if pad:
         decoded = decoded.view(-1)[:n]
     tensor.data.copy_(decoded.view(orig_shape).to(tensor.dtype))
@@ -72,18 +73,18 @@ def quant_q2_0(tensor, group_size=128):
 # bit-packing (stores scales + packed bits for real compression)
 # ---------------------------------------------------------------------------
 
-def pack_q1_0_blocks(tensor, scales, group_size=32):
-    """Pack Q1_0 quantized weights + scales into compact representation.
-       Returns: dict with packed_bits, scales, n, group_size
+def pack_q1_0_blocks(tensor, scales, group_size=128):
+    """Pack Q1_0_g128 quantized weights + scales into compact representation.
+       32 sign bits per int32 word.  Returns: dict with packed, scales, n, group_size.
     """
     w = tensor.float()
-    flat = (w.view(-1) >= 0).to(torch.uint8)
+    flat = (w.view(-1) >= 0).to(torch.int32)  # int32 to avoid uint8 overflow on shifts
     n = flat.numel()
     pad = (32 - n % 32) % 32
     if pad:
         flat = F.pad(flat, (0, pad))
     bits_blocks = flat.view(-1, 32)
-    powers = 2 ** torch.arange(32, dtype=torch.uint8)
+    powers = (2 ** torch.arange(32, dtype=torch.int64)).to(torch.int32)  # int32 powers
     packed = (bits_blocks * powers).sum(dim=1).to(torch.int32)
     return {
         "packed": packed.cpu(),
@@ -94,16 +95,16 @@ def pack_q1_0_blocks(tensor, scales, group_size=32):
 
 
 def pack_q2_0_blocks(q_codes, scales, group_size=128):
-    """Pack Q2_0 codes (0-3) + scales into compact representation.
-       Each code = 2 bits, 16 per int32.
-       Returns: dict with packed_codes, scales, n, group_size
+    """Pack ternary codes {0,1,2} (= q_raw+1) + scales into compact representation.
+       Each code = 2 bits, 16 codes per int32.
+       Returns: dict with packed, scales, n, group_size.
     """
-    q = q_codes.to(torch.uint8).view(-1)
+    q = q_codes.to(torch.int32).view(-1)  # {0,1,2}
     n = q.numel()
     pad = (16 - n % 16) % 16
     if pad:
         q = F.pad(q, (0, pad))
-    code_blocks = q.view(-1, 16).to(torch.int32)
+    code_blocks = q.view(-1, 16)
     shifts = 2 * torch.arange(16, dtype=torch.int32)
     packed = (code_blocks << shifts).sum(dim=1)
     return {
@@ -127,28 +128,31 @@ def unpack_q1_0(packed_data):
     return bits * scales_repeated
 
 
-DECODE_Q2 = torch.tensor([-1.0, 0.0, 1.0, 2.0])
+# True ternary decode table: stored code {0,1,2} -> weight multiplier {-1, 0, +1}
+DECODE_Q2 = torch.tensor([-1.0, 0.0, 1.0])
 
 
 def unpack_q2_0(packed_data):
-    """Unpack Q2_0 back to FP32 tensor."""
+    """Unpack ternary Q2_0 back to FP32 tensor."""
     packed = packed_data["packed"].to(torch.int32)
     scales = packed_data["scales"].float()
     n = packed_data["n"]
     group_size = packed_data["group_size"]
     vals = ((packed.view(-1, 1) >> (2 * torch.arange(16, device=packed.device, dtype=torch.int32))) & 3)
-    codes = vals.view(-1)[:n].to(torch.long)
+    codes = vals.view(-1)[:n].clamp(0, 2).to(torch.long)  # guard against stray 3 codes
     n_blocks = (n + group_size - 1) // group_size
     scales_repeated = scales[:n_blocks].repeat_interleave(group_size)[:n]
-    return (DECODE_Q2.to(codes.device)[codes].float()) * scales_repeated
+    return DECODE_Q2.to(codes.device)[codes].float() * scales_repeated
 
 
 # wrappers for ptq() / distill() — call in-place quant then return tensor
 def onebit_weight(w):
-    return quant_q1_0(w, group_size=32)
+    """1-bit binary quantization with g128 grouping (Bonsai Q1_0_g128)."""
+    return quant_q1_0(w, group_size=128)
 
 
 def ternary_weight(w):
+    """True ternary quantization with g128 grouping (Bonsai Q2_0 / 1.58-bit)."""
     return quant_q2_0(w, group_size=128)
 
 
@@ -909,36 +913,41 @@ def main():
     # --- pack and save ---
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    # save original fp16 weights BEFORE quant so we can compute codes/scales correctly
-    print("saving original weights for packing metadata...")
-    orig_weights = {}
-    for name, param in student.named_parameters():
-        if "bias" in name:
-            continue
-        orig_weights[name] = param.detach().cpu().clone().half()
-
+    # Pack directly from the already-quantized parameters.
+    # (Weights have been quantized in-place by ptq / quantize_experts_batched / distill.)
     print("packing quantized weights...")
     packed_state = {}
     pack_config = {}
-    param_dict = dict(student.named_parameters())
-    for name, orig_w in orig_weights.items():
-        nl = name.lower()
+    gs = 128  # group size for both 1-bit and ternary (matches Bonsai Q1_0_g128 / Q2_0)
+
+    for name, param in student.named_parameters():
+        if "bias" in name:
+            continue
         if moe_flag and should_skip(name):
-            packed_state[name] = param_dict[name].detach().cpu().half()
+            # router / gate layers kept in fp16
+            packed_state[name] = param.detach().cpu().half()
             pack_config[name] = "fp16"
             continue
-        w = orig_w.float()
+
+        w = param.detach().cpu().float()
+        n_w = w.numel()
+        # pad to multiple of group_size for scale computation
+        pad = (gs - n_w % gs) % gs
+        w_flat = w.view(-1)
+        if pad:
+            w_flat = F.pad(w_flat, (0, pad))
+        w_blocks = w_flat.view(-1, gs)
+
         if mode_name == "1bit":
-            gs = 32
-            scales = w.abs().view(-1, gs).mean(dim=1).clamp(min=1e-8)
+            scales = w_blocks.abs().mean(dim=1).clamp(min=1e-8)
             packed_state[name] = pack_q1_0_blocks(w, scales, gs)
             pack_config[name] = "1bit"
-        else:
-            gs = 128
-            scales = w.abs().view(-1, gs).max(dim=1).values.clamp(min=1e-8)
-            q = (w.view(-1, gs) / scales.unsqueeze(1)).round().to(torch.int32) + 1
-            q = q.clamp(0, 3)
-            packed_state[name] = pack_q2_0_blocks(q, scales, gs)
+        else:  # ternary
+            scales = w_blocks.abs().max(dim=1).values.clamp(min=1e-8)
+            # re-derive codes from quantized values: w / scale rounded to {-1,0,+1}
+            q = (w_blocks / scales.unsqueeze(1)).round().to(torch.int32).clamp(-1, 1)
+            codes = q + 1  # shift to {0, 1, 2} for 2-bit storage
+            packed_state[name] = pack_q2_0_blocks(codes, scales, gs)
             pack_config[name] = "ternary"
 
     # save packed weights
@@ -946,6 +955,7 @@ def main():
     torch.save({
         "pack_config": pack_config,
         "mode": mode_name,
+        "group_size": gs,
     }, Path(out_dir) / "quant_config.pt")
 
     # save model config + tokenizer (for reloading)
@@ -959,9 +969,9 @@ def main():
     orig_size = sum(p.numel() for p in student.parameters()) * 2  # fp16
     packed_path = Path(out_dir) / "quantized_weights.pt"
     packed_size = packed_path.stat().st_size
-    ratio = orig_size / packed_size
+    ratio = orig_size / packed_size if packed_size > 0 else float("inf")
     print(f"  compression: {orig_size/1024**3:.1f} GB (fp16) → "
-          f"{packed_size/1024**3:.2f} GB ({ratio:.0f}x)"
+          f"{packed_size/1024**3:.2f} GB ({ratio:.0f}x)"))
 
 
 if __name__ == "__main__":
