@@ -685,9 +685,9 @@ def main():
     batch_size = args.batch_size or 1
     max_len = args.max_len or 512
 
-        if teacher_id:
-            if interactive and not args.device:
-                print("\n--- distillation settings ---")
+    if teacher_id:
+        if interactive and not args.device:
+            print("\n--- distillation settings ---")
             device = pick_device()
             epochs = int(ask("epochs", default=str(epochs)))
             lr = float(ask("learning rate", default=str(lr)))
