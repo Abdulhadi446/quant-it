@@ -79,8 +79,11 @@ Unsloth handles automatic GPU↔CPU offloading. Expert batching keeps peak VRAM 
 ## Quick Start
 
 ```bash
+# clone the repo
 git clone https://github.com/Abdulhadi446/quant-it.git
 cd quant-it
+
+# run the installer (creates venv, installs torch + unsloth + transformers)
 ./quant.sh
 ```
 
@@ -101,29 +104,135 @@ The interactive wizard will prompt you for:
 ./quant.sh
 ```
 
-### Command Line
+### Step-by-Step Examples
+
+#### 1. Ternary quantize a small dense model (fits on any GPU)
 
 ```bash
-# PTQ ternary
-python quantize.py meta-llama/Llama-3-8B
-
-# With teacher distillation
-python quantize.py meta-llama/Llama-3-8B \
-  --teacher meta-llama/Llama-3-70B \
-  --mode ternary \
-  --epochs 3 \
-  --device cuda:0
+git clone https://github.com/Abdulhadi446/quant-it.git
+cd quant-it
+./quant.sh
+# → student: Qwen/Qwen2.5-0.5B
+# → teacher: (empty — PTQ)
+# → mode: ternary
+# → batch: auto
+# → output: Qwen2.5-0.5B-ternary
 ```
 
-### Programmatic
+#### 2. 1-bit quantize Llama with teacher distillation
+
+```bash
+./quant.sh
+# → student: meta-llama/Llama-3-8B
+# → teacher: meta-llama/Llama-3-70B
+# → mode: 1bit
+# → epochs: 3
+# → device: cuda:0
+# → calib file: (empty for dummy)
+# → output: Llama-3-8B-1bit
+```
+
+#### 3. Ternary quantize a MoE model on 2x T4
+
+```bash
+./quant.sh
+# → student: Qwen/Qwen3-30B-A3B
+# → teacher: (empty — PTQ)
+# → mode: ternary
+# → batch: auto (fits ~50 experts per batch on 2x T4)
+# → output: Qwen3-30B-A3B-ternary
+```
+
+#### 4. Manual batch size for MoE (4 experts at a time)
+
+```bash
+./quant.sh
+# → student: Qwen/Qwen3-30B-A3B
+# → teacher: (empty)
+# → mode: ternary
+# → batch: m → 4
+# → output: Qwen3-30B-A3B-ternary
+```
+
+#### 5. Ternary quantize Mistral-7B
+
+```bash
+./quant.sh
+# → student: mistralai/Mistral-7B-v0.1
+# → teacher: (empty)
+# → mode: ternary
+# → output: Mistral-7B-v0.1-ternary
+```
+
+#### 6. 1-bit quantize Phi-3 with custom calibration data
+
+```bash
+# first create a calibration file
+echo "The capital of France is Paris." > calib.txt
+echo "Machine learning is a subset of AI." >> calib.txt
+echo "Python is a popular programming language." >> calib.txt
+
+./quant.sh
+# → student: microsoft/Phi-3-mini-4k-instruct
+# → teacher: (empty)
+# → mode: 1bit
+# → output: Phi-3-mini-4k-instruct-1bit
+```
+
+#### 7. Quantize a local model
+
+```bash
+./quant.sh
+# → student: /path/to/my/local/model
+# → teacher: (empty)
+# → mode: ternary
+# → output: my-local-model-ternary
+```
+
+#### 8. Full distillation with custom hyperparameters
+
+```bash
+./quant.sh
+# → student: Qwen/Qwen2.5-7B
+# → teacher: Qwen/Qwen2.5-72B
+# → mode: ternary
+# → epochs: 5
+# → lr: 1e-4
+# → batch size: 2
+# → max len: 1024
+# → calib file: calib.txt
+# → output: Qwen2.5-7B-ternary-distilled
+```
+
+### Programmatic Usage
 
 ```python
 from quantize import ptq, ternary_weight, onebit_weight
 from transformers import AutoModelForCausalLM
 
+# ternary quantization
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B")
+model = ptq(model, ternary_weight)
+model.save_pretrained("qwen2.5-0.5b-ternary")
+
+# 1-bit quantization
 model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3-8B")
-model = ptq(model, ternary_weight)  # or onebit_weight
-model.save_pretrained("llama3-8b-ternary")
+model = ptq(model, onebit_weight)
+model.save_pretrained("llama3-8b-1bit")
+```
+
+### One-Liner Examples
+
+```bash
+# clone + install + run in one shot
+git clone https://github.com/Abdulhadi446/quant-it.git && cd quant-it && ./quant.sh
+
+# re-run after initial install (skips venv creation)
+source .venv/bin/activate && python quantize.py
+
+# quantize and push to HuggingFace
+python quantize.py Qwen/Qwen2.5-0.5B -o qwen-ternary && \
+  huggingface-cli upload my-username/qwen-2.5-0.5b-ternary qwen-ternary
 ```
 
 ---
