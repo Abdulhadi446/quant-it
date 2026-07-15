@@ -312,7 +312,7 @@ def distill(student, teacher, tok, quant_fn, calib, epochs, bs, lr, max_len, dev
                 continue
             if should_skip(name):
                 continue
-            if any("expert" in name.lower() for name in [name]):
+            if "expert" in name.lower():
                 continue
             with torch.no_grad():
                 p.copy_(quant_fn(p))

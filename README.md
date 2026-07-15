@@ -221,6 +221,21 @@ model = ptq(model, onebit_weight)
 model.save_pretrained("llama3-8b-1bit")
 ```
 
+### Running from Jupyter / IPython
+
+Shell commands need `!` prefix in Jupyter:
+
+```python
+# wrong — causes SyntaxError
+# ./quant.sh
+
+# correct
+!./quant.sh
+
+# or run the Python script directly
+!python quantize.py
+```
+
 ### One-Liner Examples
 
 ```bash
