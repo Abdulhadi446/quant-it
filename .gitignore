@@ -1,0 +1,7 @@
+papers/
+*.pyc
+__pycache__/
+.venv/
+offload/
+*.pt
+*.safetensors

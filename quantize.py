@@ -18,25 +18,180 @@ from torch.utils.data import DataLoader, Dataset
 
 
 # ---------------------------------------------------------------------------
-# quantization primitives
+# quantization primitives — block-based (Bonsai Q1_0 / Q2_0 style)
 # ---------------------------------------------------------------------------
 
-def ternary_weight(w):
-    w_fp32 = w.float()
-    scale = w_fp32.abs().mean(dim=-1, keepdim=True).clamp(min=1e-8)
-    w_norm = w_fp32 / scale
-    w_t = w_norm.tanh()
-    w_t = torch.where(w_t > 0.4, torch.ones_like(w_t), w_t)
-    w_t = torch.where(w_t < -0.4, -torch.ones_like(w_t), w_t)
-    w_t = torch.where(w_t.abs() < 0.4, torch.zeros_like(w_t), w_t)
-    return w_t.to(w.dtype)
+def quant_q1_0(tensor, group_size=32):
+    """Q1_0: 1-bit block quantization.
+       scale = mean(|w|) per block, sign encodes the bit.
+       In-place. Returns quantized tensor.
+    """
+    w = tensor.float()
+    orig_shape = w.shape
+    flat = w.view(-1)
+    n = flat.numel()
+    pad = (group_size - n % group_size) % group_size
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    blocks = flat.view(-1, group_size)
+    scales = blocks.abs().mean(dim=1, keepdim=True).clamp(min=1e-8)
+    bits = (blocks >= 0).to(flat.dtype) * 2 - 1
+    quantized = bits * scales
+    if pad:
+        quantized = quantized.view(-1)[:n]
+    tensor.data.copy_(quantized.view(orig_shape).to(tensor.dtype))
+    return tensor
 
 
+def quant_q2_0(tensor, group_size=128):
+    """Q2_0: ternary block quantization (4 values).
+       scale = max(|w|) per block.
+       q = round(w/d) + 1, clamped [0,3].
+       decode: (q-1)*d → {-d, 0, +d, +2d}.
+       In-place. Returns quantized tensor.
+    """
+    w = tensor.float()
+    orig_shape = w.shape
+    flat = w.view(-1)
+    n = flat.numel()
+    pad = (group_size - n % group_size) % group_size
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    blocks = flat.view(-1, group_size)
+    scales = blocks.abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
+    q = (blocks / scales).round().to(torch.int32) + 1
+    q = q.clamp(0, 3)
+    decoded = (q.float() - 1) * scales
+    if pad:
+        decoded = decoded.view(-1)[:n]
+    tensor.data.copy_(decoded.view(orig_shape).to(tensor.dtype))
+    return tensor
+
+
+# ---------------------------------------------------------------------------
+# bit-packing (stores scales + packed bits for real compression)
+# ---------------------------------------------------------------------------
+
+def pack_q1_0_blocks(tensor, scales, group_size=32):
+    """Pack Q1_0 quantized weights + scales into compact representation.
+       Returns: dict with packed_bits, scales, n, group_size
+    """
+    w = tensor.float()
+    flat = (w.view(-1) >= 0).to(torch.uint8)
+    n = flat.numel()
+    pad = (32 - n % 32) % 32
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    bits_blocks = flat.view(-1, 32)
+    powers = 2 ** torch.arange(32, dtype=torch.uint8)
+    packed = (bits_blocks * powers).sum(dim=1).to(torch.int32)
+    return {
+        "packed": packed.cpu(),
+        "scales": scales.cpu().half(),
+        "n": n,
+        "group_size": group_size,
+    }
+
+
+def pack_q2_0_blocks(q_codes, scales, group_size=128):
+    """Pack Q2_0 codes (0-3) + scales into compact representation.
+       Each code = 2 bits, 16 per int32.
+       Returns: dict with packed_codes, scales, n, group_size
+    """
+    q = q_codes.to(torch.uint8).view(-1)
+    n = q.numel()
+    pad = (16 - n % 16) % 16
+    if pad:
+        q = F.pad(q, (0, pad))
+    code_blocks = q.view(-1, 16).to(torch.int32)
+    shifts = 2 * torch.arange(16, dtype=torch.int32)
+    packed = (code_blocks << shifts).sum(dim=1)
+    return {
+        "packed": packed.cpu(),
+        "scales": scales.cpu().half(),
+        "n": n,
+        "group_size": group_size,
+    }
+
+
+def unpack_q1_0(packed_data):
+    """Unpack Q1_0 back to FP32 tensor."""
+    packed = packed_data["packed"].to(torch.int32)
+    scales = packed_data["scales"].float()
+    n = packed_data["n"]
+    group_size = packed_data["group_size"]
+    bits = ((packed.view(-1, 1) >> torch.arange(32, device=packed.device, dtype=torch.int32)) & 1).to(torch.float32)
+    bits = bits.view(-1)[:n] * 2 - 1
+    n_blocks = (n + group_size - 1) // group_size
+    scales_repeated = scales[:n_blocks].repeat_interleave(group_size)[:n]
+    return bits * scales_repeated
+
+
+DECODE_Q2 = torch.tensor([-1.0, 0.0, 1.0, 2.0])
+
+
+def unpack_q2_0(packed_data):
+    """Unpack Q2_0 back to FP32 tensor."""
+    packed = packed_data["packed"].to(torch.int32)
+    scales = packed_data["scales"].float()
+    n = packed_data["n"]
+    group_size = packed_data["group_size"]
+    vals = ((packed.view(-1, 1) >> (2 * torch.arange(16, device=packed.device, dtype=torch.int32))) & 3)
+    codes = vals.view(-1)[:n].to(torch.long)
+    n_blocks = (n + group_size - 1) // group_size
+    scales_repeated = scales[:n_blocks].repeat_interleave(group_size)[:n]
+    return (DECODE_Q2.to(codes.device)[codes].float()) * scales_repeated
+
+
+# wrappers for ptq() / distill() — call in-place quant then return tensor
 def onebit_weight(w):
-    return w.float().sign().to(w.dtype)
+    return quant_q1_0(w, group_size=32)
+
+
+def ternary_weight(w):
+    return quant_q2_0(w, group_size=128)
 
 
 QUANT = {"1": ("1bit", onebit_weight), "2": ("ternary", ternary_weight)}
+
+
+def dequantize_model(packed_dir, output_dir, dtype=torch.float16):
+    """Unpack quantized weights back to FP16 for inference."""
+    from transformers import AutoConfig
+    from safetensors.torch import save_file as st_save
+    from transformers import AutoTokenizer
+
+    packed_dir = Path(packed_dir)
+    config = AutoConfig.from_pretrained(packed_dir)
+    state = torch.load(packed_dir / "quantized_weights.pt", map_location="cpu", weights_only=True)
+    config_data = torch.load(packed_dir / "quant_config.pt", map_location="cpu", weights_only=True)
+    pack_config = config_data["pack_config"]
+
+    print(f"dequantizing {len(state)} layers...")
+    for name, packed_data in state.items():
+        if name not in pack_config:
+            continue
+        fmt = pack_config[name]
+        if fmt == "fp16":
+            continue
+        if fmt == "1bit":
+            state[name] = unpack_q1_0(packed_data).to(dtype)
+        elif fmt == "ternary":
+            state[name] = unpack_q2_0(packed_data).to(dtype)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config.save_pretrained(output_dir)
+    if (packed_dir / "tokenizer.json").exists():
+        AutoTokenizer.from_pretrained(packed_dir).save_pretrained(output_dir)
+
+    st_state = {}
+    for name, tensor in state.items():
+        st_name = name.replace("model.", "", 1) if name.startswith("model.") else name
+        st_state[st_name] = tensor.contiguous()
+
+    st_save(st_state, output_dir / "model.safetensors")
+    print(f"dequantized → {output_dir}  ({len(state)} layers)")
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +659,7 @@ PRESETS = {
     "qwen35b": {
         "name": "Qwen3.6-35B-A3B (MoE)",
         "model": "Qwen/Qwen3.6-35B-A3B",
+        "teacher": "Qwen/Qwen3.6-35B-A3B",
         "mode": "ternary",
         "load_4bit": False,
         "dtype": "fp16",
@@ -512,6 +668,7 @@ PRESETS = {
     "qwen30b": {
         "name": "Qwen3-30B-A3B (MoE)",
         "model": "Qwen/Qwen3-30B-A3B",
+        "teacher": "Qwen/Qwen3-30B-A3B",
         "mode": "ternary",
         "load_4bit": False,
         "dtype": "fp16",
@@ -520,6 +677,7 @@ PRESETS = {
     "llama8b": {
         "name": "Llama-3-8B (dense)",
         "model": "meta-llama/Llama-3-8B",
+        "teacher": "meta-llama/Llama-3-8B",
         "mode": "ternary",
         "load_4bit": True,
         "dtype": "fp16",
@@ -528,6 +686,7 @@ PRESETS = {
     "qwen05b": {
         "name": "Qwen2.5-0.5B (dense, quick test)",
         "model": "Qwen/Qwen2.5-0.5B",
+        "teacher": "Qwen/Qwen2.5-0.5B",
         "mode": "ternary",
         "load_4bit": False,
         "dtype": "fp16",
@@ -553,7 +712,7 @@ def _apply_preset(preset_key):
     quant_fn = onebit_weight if mode_name == "1bit" else ternary_weight
     return {
         "model_id": p["model"],
-        "teacher_id": "",
+        "teacher_id": p.get("teacher", ""),
         "mode_name": mode_name,
         "quant_fn": quant_fn,
         "load_4bit": p["load_4bit"],
@@ -566,6 +725,8 @@ def _apply_preset(preset_key):
 def main():
     parser = argparse.ArgumentParser(description="1-bit / ternary quantizer")
     parser.add_argument("--model", "-m", default=None, help="student model (HF name or path)")
+    parser.add_argument("--dequantize", default=None,
+                        help="dequantize a packed model directory back to FP16")
     parser.add_argument("--preset", choices=list(PRESETS.keys()) + ["list"], default=None,
                         help="use a preset config (use 'list' to show available presets)")
     parser.add_argument("--teacher", "-t", default=None, help="teacher model (enables distillation)")
@@ -587,6 +748,12 @@ def main():
         print("\navailable presets:")
         for k, v in PRESETS.items():
             print(f"  {k:12s}  {v['model']}  ({v['mode']})")
+        return
+
+    # --dequantize
+    if args.dequantize:
+        output = args.output or f"{args.dequantize.rstrip('/').split('/')[-1]}-dequantized"
+        dequantize_model(args.dequantize, output)
         return
 
     interactive = _is_interactive() and not args.preset
@@ -739,11 +906,62 @@ def main():
         print("running PTQ...")
         student = ptq(student, quant_fn)
 
-    # --- save ---
+    # --- pack and save ---
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    student.save_pretrained(out_dir, safe_serialization=True)
+
+    # save original fp16 weights BEFORE quant so we can compute codes/scales correctly
+    print("saving original weights for packing metadata...")
+    orig_weights = {}
+    for name, param in student.named_parameters():
+        if "bias" in name:
+            continue
+        orig_weights[name] = param.detach().cpu().clone().half()
+
+    print("packing quantized weights...")
+    packed_state = {}
+    pack_config = {}
+    param_dict = dict(student.named_parameters())
+    for name, orig_w in orig_weights.items():
+        nl = name.lower()
+        if moe_flag and should_skip(name):
+            packed_state[name] = param_dict[name].detach().cpu().half()
+            pack_config[name] = "fp16"
+            continue
+        w = orig_w.float()
+        if mode_name == "1bit":
+            gs = 32
+            scales = w.abs().view(-1, gs).mean(dim=1).clamp(min=1e-8)
+            packed_state[name] = pack_q1_0_blocks(w, scales, gs)
+            pack_config[name] = "1bit"
+        else:
+            gs = 128
+            scales = w.abs().view(-1, gs).max(dim=1).values.clamp(min=1e-8)
+            q = (w.view(-1, gs) / scales.unsqueeze(1)).round().to(torch.int32) + 1
+            q = q.clamp(0, 3)
+            packed_state[name] = pack_q2_0_blocks(q, scales, gs)
+            pack_config[name] = "ternary"
+
+    # save packed weights
+    torch.save(packed_state, Path(out_dir) / "quantized_weights.pt")
+    torch.save({
+        "pack_config": pack_config,
+        "mode": mode_name,
+    }, Path(out_dir) / "quant_config.pt")
+
+    # save model config + tokenizer (for reloading)
+    student.config.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)
     print(f"\ndone — saved to {out_dir}")
+    print(f"  config + tokenizer → {out_dir}/")
+    print(f"  packed weights      → {out_dir}/quantized_weights.pt")
+
+    # show compression
+    orig_size = sum(p.numel() for p in student.parameters()) * 2  # fp16
+    packed_path = Path(out_dir) / "quantized_weights.pt"
+    packed_size = packed_path.stat().st_size
+    ratio = orig_size / packed_size
+    print(f"  compression: {orig_size/1024**3:.1f} GB (fp16) → "
+          f"{packed_size/1024**3:.2f} GB ({ratio:.0f}x)"
 
 
 if __name__ == "__main__":
