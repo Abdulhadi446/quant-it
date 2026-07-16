@@ -11,18 +11,21 @@ echo "  mode: binary {-1, +1}, 1.125 bits/weight"
 echo "  expected size: ~4 GB GGUF"
 echo "=============================================="
 
-# --- persistent HF cache ---
+# --- HF cache on /tmp (more disk space on Kaggle) ---
 if [ -n "${KAGGLE_KERNEL_RUN_TYPE:-}" ]; then
-    export HF_HOME="/kaggle/working/.cache/huggingface"
+    export HF_HOME="/tmp/hf_cache"
+    WORK_DIR="/tmp/quant_work"
 else
     export HF_HOME="$HOME/.cache/huggingface"
+    WORK_DIR="."
 fi
 export TRANSFORMERS_CACHE="$HF_HOME"
 export TORCH_EXTENSIONS_DIR="/tmp/torch_extensions"
-mkdir -p "$HF_HOME" "$TORCH_EXTENSIONS_DIR"
+mkdir -p "$HF_HOME" "$TORCH_EXTENSIONS_DIR" "$WORK_DIR"
 
 PYTHON="$(command -v python3)"
 echo "HF cache: $HF_HOME"
+echo "Work dir: $WORK_DIR"
 
 # --- install deps ---
 echo ""
@@ -52,7 +55,7 @@ try:
     print(f'  RAM: {m.available/1024**3:.1f}/{m.total/1024**3:.1f} GB free')
 except: pass
 import shutil
-print(f'  Disk: {shutil.disk_usage(\".\").free/1024**3:.1f} GB free')
+print(f'  Disk: {shutil.disk_usage(\"/tmp\").free/1024**3:.1f} GB free (/tmp)')
 " 2>/dev/null || true
 
 # --- download model if not cached ---
@@ -62,7 +65,7 @@ MODEL_CACHE="$HF_HOME/hub"
 if [ -d "$MODEL_CACHE" ] && ls "$MODEL_CACHE"/models--google--gemma-4-26B-A4B 2>/dev/null | head -1 > /dev/null; then
     echo "  gemma-4-26B-A4B already cached"
 else
-    echo "  downloading google/gemma-4-26B-A4B (~50 GB)..."
+    echo "  downloading google/gemma-4-26B-A4B (~50 GB) to $HF_HOME..."
     $PYTHON quantize.py --download gemma4_26b
 fi
 
@@ -76,13 +79,13 @@ $PYTHON quantize.py --preset gemma4_26b \
     --mode 1bit \
     --device cuda:0 \
     --expert-batch 8 \
-    --output gemma-4-26b-A4B-bitnet
+    --output "$WORK_DIR/gemma-4-26b-A4B-bitnet"
 
 # --- convert to GGUF ---
 echo ""
 echo "[5/5] converting to GGUF..."
-$PYTHON quantize.py --gguf gemma-4-26b-A4B-bitnet \
-    --output gemma-4-26b-A4B-bitnet.gguf
+$PYTHON quantize.py --gguf "$WORK_DIR/gemma-4-26b-A4B-bitnet" \
+    --output "$WORK_DIR/gemma-4-26b-A4B-bitnet.gguf"
 
 echo ""
 echo "=============================================="
@@ -90,7 +93,7 @@ echo "  done!"
 echo "=============================================="
 echo ""
 echo "output:"
-echo "  GGUF: gemma-4-26b-A4B-bitnet.gguf"
+echo "  GGUF: $WORK_DIR/gemma-4-26b-A4B-bitnet.gguf"
 echo ""
 echo "use with llama.cpp:"
-echo "  ./llama-server -m gemma-4-26b-A4B-bitnet.gguf -c 4096"
+echo "  ./llama-server -m $WORK_DIR/gemma-4-26b-A4B-bitnet.gguf -c 4096"

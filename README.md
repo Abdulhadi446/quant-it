@@ -158,7 +158,7 @@ The interactive wizard will prompt you for:
 
 ### Preset Scripts (one-shot)
 
-Ready-to-run scripts in `presets/` for popular models:
+Ready-to-run scripts in `presets/` for popular models. On Kaggle, model weights download to `/tmp/hf_cache` and quantization runs in `/tmp/quant_work` to avoid disk space limits.
 
 ```bash
 # Qwen3.6-35B-A3B — BitNet 1-bit (binary, ~4 GB GGUF)
