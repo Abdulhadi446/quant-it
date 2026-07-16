@@ -593,6 +593,7 @@ def load_with_unsloth(model_id, dtype, load_4bit, device_map="auto"):
                 device_map=device_map,
                 trust_remote_code=True,
                 load_in_4bit=True,
+                offload_folder="offload",
             )
             tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
             return model, tokenizer, False
@@ -602,12 +603,18 @@ def load_teacher_unsloth(model_id, dtype, load_4bit=False):
     """Load teacher model — tries fp16 first, falls back to 4-bit if OOM."""
     try:
         from unsloth import FastLanguageModel, FastModel
-        try:
-            model, tok = FastModel.from_pretrained(
+        for attempt in range(2):
+            use_4bit = load_4bit or (attempt == 1)
+            kw = dict(
                 model_name=model_id, max_seq_length=4096,
-                load_in_4bit=load_4bit, dtype=dtype,
+                load_in_4bit=use_4bit, dtype=dtype,
                 trust_remote_code=True,
+                offload_folder="offload",
             )
+            try:
+                model, tok = FastModel.from_pretrained(**kw)
+            except Exception:
+                model, tok = FastLanguageModel.from_pretrained(**kw)
             # check for fp32 OOM
             total_gb = sum(p.numel() for p in model.parameters()) * 4 / (1024**3)
             free_gb = get_total_free_vram_gb()
@@ -616,20 +623,16 @@ def load_teacher_unsloth(model_id, dtype, load_4bit=False):
                 del model
                 gc.collect()
                 torch.cuda.empty_cache()
-                return load_teacher_unsloth(model_id, dtype, load_4bit=True)
+                continue
             return model, tok
-        except Exception:
-            model, tok = FastLanguageModel.from_pretrained(
-                model_name=model_id, max_seq_length=4096,
-                load_in_4bit=load_4bit, dtype=dtype,
-                trust_remote_code=True,
-            )
-            return model, tok
+        # fall through — even 4-bit failed somehow
+        raise RuntimeError("teacher loading failed after 2 attempts")
     except ImportError:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         model = AutoModelForCausalLM.from_pretrained(
             model_id, torch_dtype=dtype, device_map="auto",
-            trust_remote_code=True, load_in_4bit=load_4bit,
+            trust_remote_code=True, load_in_4bit=True,
+            offload_folder="offload",
         )
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         return model, tok
