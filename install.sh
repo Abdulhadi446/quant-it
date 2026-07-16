@@ -7,6 +7,12 @@ echo "========================================"
 echo "  quant-it — dependency installer"
 echo "========================================"
 
+# Kaggle: use persistent /kaggle/working for HF cache
+if [ -n "${KAGGLE_KERNEL_RUN_TYPE:-}" ]; then
+    export HF_HOME="/kaggle/working/.cache/huggingface"
+    echo "  Kaggle detected — HF cache: $HF_HOME"
+fi
+
 PYTHON="$(command -v python3)"
 
 # --- check existing ---
@@ -85,4 +91,9 @@ except: print('  unsloth: not installed (optional)')
 
 echo ""
 echo "done — all dependencies installed"
-echo "run:  $PYTHON quantize.py --help"
+echo ""
+echo "usage:"
+echo "  $PYTHON quantize.py --preset qwen35b"
+echo "  $PYTHON quantize.py --download qwen35b    # pre-download model to cache"
+echo "  $PYTHON quantize.py --download qwen05b"
+echo "  $PYTHON quantize.py --preset qwen05b"

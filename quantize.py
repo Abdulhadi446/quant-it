@@ -11,6 +11,11 @@ import os
 import sys
 from pathlib import Path
 
+# set HF cache to persistent directory (Kaggle /kaggle/working is persistent)
+os.environ.setdefault("HF_HOME", str(Path(os.environ.get("HF_HOME", "")) or Path.home() / ".cache" / "huggingface"))
+if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
+    os.environ["HF_HOME"] = "/kaggle/working/.cache/huggingface"
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -765,6 +770,8 @@ def _apply_preset(preset_key):
 def main():
     parser = argparse.ArgumentParser(description="1-bit / ternary quantizer")
     parser.add_argument("--model", "-m", default=None, help="student model (HF name or path)")
+    parser.add_argument("--download", default=None,
+                        help="download a model to HF cache (use preset name or HF model ID)")
     parser.add_argument("--dequantize", default=None,
                         help="dequantize a packed model directory back to FP16")
     parser.add_argument("--preset", choices=list(PRESETS.keys()) + ["list"], default=None,
@@ -788,6 +795,22 @@ def main():
         print("\navailable presets:")
         for k, v in PRESETS.items():
             print(f"  {k:12s}  {v['model']}  ({v['mode']})")
+        return
+
+    # --download: pre-download model to HF cache
+    if args.download:
+        dl_id = PRESETS[args.download]["model"] if args.download in PRESETS else args.download
+        print(f"downloading {dl_id} to HF cache...")
+        print(f"  cache: {os.environ['HF_HOME']}")
+        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+        AutoConfig.from_pretrained(dl_id, trust_remote_code=True)
+        AutoTokenizer.from_pretrained(dl_id, trust_remote_code=True)
+        AutoModelForCausalLM.from_pretrained(
+            dl_id, torch_dtype=torch.float16,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+        print(f"  done — cached at {os.environ['HF_HOME']}/hub/")
         return
 
     # --dequantize
