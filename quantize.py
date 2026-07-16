@@ -13,8 +13,9 @@ from pathlib import Path
 
 # set HF cache to persistent directory
 if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
-    # Kaggle: /kaggle/working persists across sessions
-    os.environ["HF_HOME"] = "/kaggle/working/.cache/huggingface"
+    # Kaggle: /tmp has more disk space than /kaggle/working
+    if "HF_HOME" not in os.environ:
+        os.environ["HF_HOME"] = "/tmp/hf_cache"
 elif "HF_HOME" not in os.environ:
     # local: use ~/.cache (not ./cache)
     os.environ["HF_HOME"] = str(Path.home() / ".cache" / "huggingface")
