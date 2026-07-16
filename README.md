@@ -156,6 +156,26 @@ The interactive wizard will prompt you for:
 6. Expert batch size (auto or manual)
 7. Output directory
 
+### Preset Scripts (one-shot)
+
+Ready-to-run scripts in `presets/` for popular models:
+
+```bash
+# Qwen3.6-35B-A3B — BitNet 1-bit (binary, ~4 GB GGUF)
+bash presets/quantize_qwen35b_bitnet.sh
+
+# Gemma 4 31B — dense, ternary (~7 GB GGUF)
+bash presets/quantize_gemma4_31b.sh
+
+# Gemma 4 26B-A4B — MoE, ternary (~7 GB GGUF)
+bash presets/quantize_gemma4_26b.sh
+
+# Qwen3.5-0.8B — small dense, ternary (~200 MB GGUF)
+bash presets/quantize_qwen35_0xb.sh
+```
+
+Each script handles: install deps → download model → quantize → export GGUF.
+
 ---
 
 ## Usage
@@ -378,6 +398,15 @@ The Bonsai family demonstrates what extreme quantization achieves on dense model
 | Ternary Bonsai 27B | 27B | Q2_0 | 5.9 GB | 88.1 | 80.5 (−5.4%) |
 | 1-bit Bonsai 27B | 27B | Q1_0 | 3.9 GB | 82.8 | 76.1 (−10.6%) |
 | Bonsai 0.5B (ternary) | 0.5B | Q2_0 | ~170 MB | 30.3 | — |
+
+### Supported Presets
+
+| Preset Script | Model | Type | Mode | Expected GGUF Size |
+|--------------|-------|------|------|-------------------|
+| `quantize_qwen35b_bitnet.sh` | Qwen3.6-35B-A3B | MoE | 1-bit | ~4 GB |
+| `quantize_gemma4_31b.sh` | Gemma 4 31B | Dense | Ternary | ~7 GB |
+| `quantize_gemma4_26b.sh` | Gemma 4 26B-A4B | MoE | Ternary | ~7 GB |
+| `quantize_qwen35_0xb.sh` | Qwen3.5-0.8B | Dense | Ternary | ~200 MB |
 
 **Intelligence Density** = −log₂(Pₑ) / N_GB where Pₑ = 1 − score/100. Ternary models achieve 7–11× higher intelligence density than their FP16 counterparts.
 

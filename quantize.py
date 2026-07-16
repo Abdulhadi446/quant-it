@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader, Dataset
 
 def quant_q1_0(tensor, group_size=128):
     """Q1_0_g128: 1-bit block quantization with group size 128 (matches Bonsai Q1_0_g128).
-       scale = mean(|w|) per block, sign encodes the bit.
+       scale = max(|w|) per block (absmax), sign encodes the bit.
        weights -> {-scale, +scale} within each group.
        In-place. Returns quantized tensor.
     """
@@ -43,7 +43,7 @@ def quant_q1_0(tensor, group_size=128):
     if pad:
         flat = F.pad(flat, (0, pad))
     blocks = flat.view(-1, group_size)
-    scales = blocks.abs().mean(dim=1, keepdim=True).clamp(min=1e-8)
+    scales = blocks.abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
     bits = (blocks >= 0).to(flat.dtype) * 2 - 1  # {0,1} -> {-1,+1}
     quantized = bits * scales
     if pad:
@@ -136,8 +136,9 @@ def unpack_q1_0(packed_data):
     return bits * scales_repeated
 
 
-# True ternary decode table: stored code {0,1,2} -> weight multiplier {-1, 0, +1}
-DECODE_Q2 = torch.tensor([-1.0, 0.0, 1.0])
+# Bonsai Q2_0 ternary decode table: 2-bit code -> weight multiplier
+# 0b00(0)->-1, 0b01(1)->0, 0b10(2)->+1, 0b11(3)->0 (duplicate zero)
+DECODE_Q2 = torch.tensor([-1.0, 0.0, 1.0, 0.0])
 
 
 def unpack_q2_0(packed_data):
@@ -147,7 +148,7 @@ def unpack_q2_0(packed_data):
     n = packed_data["n"]
     group_size = packed_data["group_size"]
     vals = ((packed.view(-1, 1) >> (2 * torch.arange(16, device=packed.device, dtype=torch.int32))) & 3)
-    codes = vals.view(-1)[:n].clamp(0, 2).to(torch.long)  # guard against stray 3 codes
+    codes = vals.view(-1)[:n].clamp(0, 3).to(torch.long)  # Bonsai: code3 maps to 0
     n_blocks = (n + group_size - 1) // group_size
     scales_repeated = scales[:n_blocks].repeat_interleave(group_size)[:n]
     return DECODE_Q2.to(codes.device)[codes].float() * scales_repeated
@@ -849,6 +850,33 @@ PRESETS = {
         "dtype": "fp16",
         "expert_batch": None,
     },
+    "qwen35_08b": {
+        "name": "Qwen3.5-0.8B (dense, small)",
+        "model": "Qwen/Qwen3.5-0.8B",
+        "teacher": "Qwen/Qwen3.5-0.8B",
+        "mode": "ternary",
+        "load_4bit": False,
+        "dtype": "fp16",
+        "expert_batch": None,
+    },
+    "gemma4_31b": {
+        "name": "Gemma 4 31B (dense)",
+        "model": "google/gemma-4-31B",
+        "teacher": "google/gemma-4-31B",
+        "mode": "ternary",
+        "load_4bit": True,
+        "dtype": "fp16",
+        "expert_batch": None,
+    },
+    "gemma4_26b": {
+        "name": "Gemma 4 26B-A4B (MoE)",
+        "model": "google/gemma-4-26B-A4B",
+        "teacher": "google/gemma-4-26B-A4B",
+        "mode": "ternary",
+        "load_4bit": True,
+        "dtype": "fp16",
+        "expert_batch": None,
+    },
     "llama8b": {
         "name": "Llama-3-8B (dense)",
         "model": "meta-llama/Llama-3-8B",
@@ -1177,7 +1205,7 @@ def main():
         w_blocks = w_flat.view(-1, gs)
 
         if mode_name == "1bit":
-            scales = w_blocks.abs().mean(dim=1).clamp(min=1e-8)
+            scales = w_blocks.abs().max(dim=1).values.clamp(min=1e-8)  # Bonsai absmax
             packed_state[name] = pack_q1_0_blocks(w, scales, gs)
             pack_config[name] = "1bit"
         else:  # ternary
