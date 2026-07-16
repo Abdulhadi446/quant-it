@@ -171,7 +171,7 @@ bash presets/quantize_gemma4_31b.sh
 bash presets/quantize_gemma4_26b.sh
 
 # Qwen3.5-0.8B — small dense, ternary (~200 MB GGUF)
-bash presets/quantize_qwen35_0xb.sh
+bash presets/quantize_qwen35_08b.sh
 ```
 
 Each script handles: install deps → download model → quantize → export GGUF.
@@ -406,7 +406,7 @@ The Bonsai family demonstrates what extreme quantization achieves on dense model
 | `quantize_qwen35b_bitnet.sh` | Qwen3.6-35B-A3B | MoE | 1-bit | ~4 GB |
 | `quantize_gemma4_31b.sh` | Gemma 4 31B | Dense | Ternary | ~7 GB |
 | `quantize_gemma4_26b.sh` | Gemma 4 26B-A4B | MoE | Ternary | ~7 GB |
-| `quantize_qwen35_0xb.sh` | Qwen3.5-0.8B | Dense | Ternary | ~200 MB |
+| `quantize_qwen35_08b.sh` | Qwen3.5-0.8B | Dense | Ternary | ~200 MB |
 
 **Intelligence Density** = −log₂(Pₑ) / N_GB where Pₑ = 1 − score/100. Ternary models achieve 7–11× higher intelligence density than their FP16 counterparts.
 
