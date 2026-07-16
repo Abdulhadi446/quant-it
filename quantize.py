@@ -930,11 +930,52 @@ def main():
         print(f"  auto batch size: {auto_bs} experts/iter (~{expert_bytes/(1024**2):.1f} MB each)")
 
     if teacher_id:
-        print(f"loading teacher: {teacher_id}")
-        teacher, _ = load_teacher_unsloth(teacher_id, dtype)
-        print("starting distillation...")
-        student = distill(student, teacher, tokenizer, quant_fn,
-                          calib_texts, epochs, batch_size, lr, max_len, device)
+        # estimate if both models can fit: student (4-bit ≈ 0.5B) + teacher (≈ student)
+        # rough check: total_params * bytes_per_param > free_vram + free_ram
+        total_params = sum(p.numel() for p in student.parameters())
+        student_gb = total_params * 0.5 / (1024**3)  # 4-bit ≈ 0.5 bytes/param
+        teacher_gb = total_params * 0.5 / (1024**3)  # same estimate
+        free_vram = get_total_free_vram_gb()
+        try:
+            import psutil
+            free_ram = psutil.virtual_memory().available / (1024**3)
+        except ImportError:
+            free_ram = 20  # guess
+
+        if student_gb + teacher_gb > free_vram + free_ram * 0.7:
+            print(f"  not enough memory for teacher+student "
+                  f"(need ~{student_gb+teacher_gb:.0f} GB, have "
+                  f"{free_vram:.0f} VRAM + {free_ram:.0f} RAM). "
+                  f"falling back to PTQ-only.")
+            teacher = None
+        else:
+            print(f"loading teacher: {teacher_id}")
+            try:
+                teacher, _ = load_teacher_unsloth(teacher_id, dtype)
+            except Exception as e:
+                print(f"  teacher loading failed ({e}). falling back to PTQ-only.")
+                teacher = None
+            # clean up any partial offload
+            import shutil
+            shutil.rmtree("offload", ignore_errors=True)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if teacher is not None:
+            print("starting distillation...")
+            student = distill(student, teacher, tokenizer, quant_fn,
+                              calib_texts, epochs, batch_size, lr, max_len, device)
+        else:
+            print("running PTQ (no teacher)...")
+            if moe_flag:
+                student = quantize_experts_batched(
+                    student, quant_fn, dtype,
+                    batch_size=manual_batch,
+                    device=device,
+                )
+            else:
+                student = ptq(student, quant_fn)
     elif moe_flag:
         print("running expert-batched PTQ...")
         student = quantize_experts_batched(
