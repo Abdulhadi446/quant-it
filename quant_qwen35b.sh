@@ -58,21 +58,23 @@ else
     $PYTHON quantize.py --download qwen35b
 fi
 
-# --- quantize ---
+# --- quantize (BitNet-style 1-bit) ---
 echo ""
-echo "[4/5] quantizing Qwen3.6-35B-A3B (ternary, PTQ mode)..."
+echo "[4/5] quantizing Qwen3.6-35B-A3B (BitNet 1-bit, PTQ mode)..."
+echo "  weights: {-1, +1} per block, scale = mean(|w|)"
 echo "  note: teacher distillation skipped — 35B MoE + teacher won't fit"
 echo ""
 $PYTHON quantize.py --preset qwen35b \
+    --mode 1bit \
     --device cuda:0 \
     --expert-batch 4 \
-    --output Qwen3.6-35B-A3B-ternary
+    --output Qwen3.6-35B-A3B-bitnet
 
 # --- convert to GGUF ---
 echo ""
 echo "[5/5] converting to GGUF..."
-$PYTHON quantize.py --gguf Qwen3.6-35B-A3B-ternary \
-    --output Qwen3.6-35B-A3B-ternary.gguf
+$PYTHON quantize.py --gguf Qwen3.6-35B-A3B-bitnet \
+    --output Qwen3.6-35B-A3B-bitnet.gguf
 
 echo ""
 echo "=============================================="
@@ -80,14 +82,14 @@ echo "  done!"
 echo "=============================================="
 echo ""
 echo "output:"
-echo "  GGUF: Qwen3.6-35B-A3B-ternary.gguf"
+echo "  GGUF: Qwen3.6-35B-A3B-bitnet.gguf"
 echo ""
 echo "use with llama.cpp:"
-echo "  ./llama-server -m Qwen3.6-35B-A3B-ternary.gguf -c 4096"
+echo "  ./llama-server -m Qwen3.6-35B-A3B-bitnet.gguf -c 4096"
 echo ""
 echo "use with ollama:"
-echo "  ollama create qwen35b-ternary -f Modelfile"
-echo "  # Modelfile: FROM ./Qwen3.6-35B-A3B-ternary.gguf"
+echo "  ollama create qwen35b-bitnet -f Modelfile"
+echo "  # Modelfile: FROM ./Qwen3.6-35B-A3B-bitnet.gguf"
 echo ""
 echo "use with lmstudio:"
 echo "  drag Qwen3.6-35B-A3B-ternary.gguf into LM Studio"
