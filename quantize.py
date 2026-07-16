@@ -11,10 +11,13 @@ import os
 import sys
 from pathlib import Path
 
-# set HF cache to persistent directory (Kaggle /kaggle/working is persistent)
-os.environ.setdefault("HF_HOME", str(Path(os.environ.get("HF_HOME", "")) or Path.home() / ".cache" / "huggingface"))
+# set HF cache to persistent directory
 if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
+    # Kaggle: /kaggle/working persists across sessions
     os.environ["HF_HOME"] = "/kaggle/working/.cache/huggingface"
+elif "HF_HOME" not in os.environ:
+    # local: use ~/.cache (not ./cache)
+    os.environ["HF_HOME"] = str(Path.home() / ".cache" / "huggingface")
 
 import torch
 import torch.nn as nn

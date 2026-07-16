@@ -7,11 +7,13 @@ echo "========================================"
 echo "  quant-it — dependency installer"
 echo "========================================"
 
-# Kaggle: use persistent /kaggle/working for HF cache
+# HF cache: Kaggle → /kaggle/working, local → ~/.cache
 if [ -n "${KAGGLE_KERNEL_RUN_TYPE:-}" ]; then
     export HF_HOME="/kaggle/working/.cache/huggingface"
-    echo "  Kaggle detected — HF cache: $HF_HOME"
+else
+    export HF_HOME="$HOME/.cache/huggingface"
 fi
+export TRANSFORMERS_CACHE="$HF_HOME"
 
 PYTHON="$(command -v python3)"
 

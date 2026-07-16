@@ -7,8 +7,12 @@ echo "=============================================="
 echo "  Qwen3.6-35B-A3B (MoE) — quantize + GGUF"
 echo "=============================================="
 
-# --- persistent HF cache for Kaggle ---
-export HF_HOME="/kaggle/working/.cache/huggingface"
+# --- persistent HF cache ---
+if [ -n "${KAGGLE_KERNEL_RUN_TYPE:-}" ]; then
+    export HF_HOME="/kaggle/working/.cache/huggingface"
+else
+    export HF_HOME="$HOME/.cache/huggingface"
+fi
 export TRANSFORMERS_CACHE="$HF_HOME"
 export TORCH_EXTENSIONS_DIR="/tmp/torch_extensions"
 mkdir -p "$HF_HOME" "$TORCH_EXTENSIONS_DIR"
