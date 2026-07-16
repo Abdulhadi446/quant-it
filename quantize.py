@@ -305,7 +305,7 @@ def save_gguf(packed_dir, output_path):
     writer.add_head_count_kv(n_kv_heads)
     writer.add_block_count(n_layers)
     writer.add_rope_freq_base(rope_theta)
-    writer.add_layer_norm_rms_epsilon(rms_eps)
+    writer.add_layer_norm_rms_eps(rms_eps)
     writer.add_file_type(gguf.GGMLFileType.ALL_F32)
 
     # write tensors — unpack from packed format, write as F16
