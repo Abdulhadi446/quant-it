@@ -204,6 +204,133 @@ def dequantize_model(packed_dir, output_dir, dtype=torch.float16):
 
 
 # ---------------------------------------------------------------------------
+# GGUF export (for llama.cpp / ollama / lmstudio)
+# ---------------------------------------------------------------------------
+
+# HF → GGUF tensor name mapping for common architectures
+_TENSOR_MAP = {
+    "embed_tokens": "token_embd",
+    "self_attn.q_proj": "attn_q",
+    "self_attn.k_proj": "attn_k",
+    "self_attn.v_proj": "attn_v",
+    "self_attn.o_proj": "attn_output",
+    "mlp.gate_proj": "ffn_gate",
+    "mlp.up_proj": "ffn_up",
+    "mlp.down_proj": "ffn_down",
+    "mlp.experts": "ffn_gate",  # MoE experts → handled separately
+    "input_layernorm": "attn_norm",
+    "post_attention_layernorm": "ffn_norm",
+    "norm": "output_norm",
+}
+
+
+def _map_tensor_name(name, arch):
+    """Map HF tensor name to GGUF name."""
+    parts = name.split(".")
+    # embedding
+    if "embed_tokens" in name:
+        return "token_embd.weight"
+    # final norm
+    if name.endswith(".norm.weight") and "layers" not in name:
+        return "output_norm.weight"
+    # lm_head
+    if "lm_head" in name:
+        return "output.weight"
+    # layer tensors
+    for i, p in enumerate(parts):
+        if p == "layers" and i + 1 < len(parts):
+            layer_idx = parts[i + 1]
+            rest = ".".join(parts[i + 2:])
+            for hf_key, gguf_key in _TENSOR_MAP.items():
+                if hf_key in rest:
+                    suffix = rest.split(hf_key)[-1]
+                    # MoE expert handling: mlp.experts.{e}.gate_proj → ffn_gate.{e}
+                    if "experts" in rest:
+                        exp_match = rest.split("experts.")
+                        if len(exp_match) > 1:
+                            exp_idx = exp_match[1].split(".")[0]
+                            expert_part = ".".join(exp_match[1].split(".")[1:])
+                            for ehf, egguf in _TENSOR_MAP.items():
+                                if ehf in expert_part:
+                                    return f"blk.{layer_idx}.{egguf}.{exp_idx}.weight"
+                    return f"blk.{layer_idx}.{gguf_key}{suffix}"
+    return name
+
+
+def save_gguf(packed_dir, output_path):
+    """Convert quantized model to GGUF format (FP16).
+       Unpacks packed weights incrementally to avoid OOM.
+    """
+    try:
+        import gguf
+    except ImportError:
+        print("  installing gguf package...")
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "gguf", "-q"])
+        import gguf
+
+    from transformers import AutoConfig
+
+    packed_dir = Path(packed_dir)
+    config = AutoConfig.from_pretrained(packed_dir)
+    state = torch.load(packed_dir / "quantized_weights.pt", map_location="cpu", weights_only=True)
+    config_data = torch.load(packed_dir / "quant_config.pt", map_location="cpu", weights_only=True)
+    pack_config = config_data["pack_config"]
+
+    arch = getattr(config, "model_type", "llama")
+    n_layers = getattr(config, "num_hidden_layers", 32)
+    n_heads = getattr(config, "num_attention_heads", 32)
+    n_kv_heads = getattr(config, "num_key_value_heads", n_heads)
+    hidden = getattr(config, "hidden_size", 4096)
+    intermediate = getattr(config, "intermediate_size", 11008)
+    vocab = getattr(config, "vocab_size", 32000)
+    max_ctx = getattr(config, "max_position_embeddings", 4096)
+    rms_eps = getattr(config, "rms_norm_eps", 1e-6)
+    rope_theta = getattr(config, "rope_theta", 10000.0)
+
+    print(f"writing GGUF → {output_path}")
+    print(f"  arch: {arch}  layers: {n_layers}  hidden: {hidden}")
+
+    writer = gguf.GGUFWriter(str(output_path), arch)
+    writer.add_name(packed_dir.name)
+    writer.add_context_length(max_ctx)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_head_count(n_heads)
+    writer.add_head_count_kv(n_kv_heads)
+    writer.add_block_count(n_layers)
+    writer.add_rope_freq_base(rope_theta)
+    writer.add_layer_norm_rms_epsilon(rms_eps)
+    writer.add_file_type(gguf.GGMLFileType.ALL_F32)
+
+    # write tensors — unpack from packed format, write as F16
+    for name, packed_data in state.items():
+        fmt = pack_config.get(name, "fp16")
+        if fmt == "fp16":
+            tensor = packed_data.to(torch.float16)
+        elif fmt == "1bit":
+            tensor = unpack_q1_0(packed_data).to(torch.float16)
+        elif fmt == "ternary":
+            tensor = unpack_q2_0(packed_data).to(torch.float16)
+        else:
+            tensor = packed_data.to(torch.float16)
+
+        gguf_name = _map_tensor_name(name, arch)
+        writer.add_tensor(gguf_name, tensor.numpy(), raw_dtype=gguf.GGMLQuantizationType.F16)
+        print(f"  {name} → {gguf_name}  {list(tensor.shape)}")
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+    size_mb = Path(output_path).stat().st_size / (1024**2)
+    orig_mb = sum(p.numel() for p in state.values()) * 2 / (1024**2)
+    print(f"\n  GGUF saved → {output_path}")
+    print(f"  size: {size_mb:.0f} MB  (FP16, original was {orig_mb:.0f} MB)")
+
+
+# ---------------------------------------------------------------------------
 # MoE detection + expert enumeration
 # ---------------------------------------------------------------------------
 
@@ -774,6 +901,8 @@ def main():
                         help="download a model to HF cache (use preset name or HF model ID)")
     parser.add_argument("--dequantize", default=None,
                         help="dequantize a packed model directory back to FP16")
+    parser.add_argument("--gguf", default=None,
+                        help="convert a packed model directory to GGUF format")
     parser.add_argument("--preset", choices=list(PRESETS.keys()) + ["list"], default=None,
                         help="use a preset config (use 'list' to show available presets)")
     parser.add_argument("--teacher", "-t", default=None, help="teacher model (enables distillation)")
@@ -817,6 +946,12 @@ def main():
     if args.dequantize:
         output = args.output or f"{args.dequantize.rstrip('/').split('/')[-1]}-dequantized"
         dequantize_model(args.dequantize, output)
+        return
+
+    # --gguf
+    if args.gguf:
+        output = args.output or f"{args.gguf.rstrip('/').split('/')[-1]}.gguf"
+        save_gguf(args.gguf, output)
         return
 
     interactive = _is_interactive() and not args.preset

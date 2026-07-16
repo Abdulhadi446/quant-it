@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "=============================================="
-echo "  Qwen3.6-35B-A3B (MoE) — quantize + finetune"
+echo "  Qwen3.6-35B-A3B (MoE) — quantize + GGUF"
 echo "=============================================="
 
 # --- persistent HF cache for Kaggle ---
@@ -23,7 +23,7 @@ $PYTHON -m pip install -q \
     torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu121 2>/dev/null || true
 $PYTHON -m pip install -q \
-    transformers accelerate safetensors sentencepiece protobuf psutil
+    transformers accelerate safetensors sentencepiece protobuf psutil gguf
 $PYTHON -m pip install -q unsloth 2>/dev/null || \
     $PYTHON -m pip install -q "unsloth[cu121]" 2>/dev/null || \
     echo "  unsloth install skipped"
@@ -43,8 +43,8 @@ try:
     m = psutil.virtual_memory()
     print(f'  RAM: {m.available/1024**3:.1f}/{m.total/1024**3:.1f} GB free')
 except: pass
-print(f'  Disk: {shutil.disk_usage(\".\").free/1024**3:.1f} GB free')
 import shutil
+print(f'  Disk: {shutil.disk_usage(\".\").free/1024**3:.1f} GB free')
 " 2>/dev/null || true
 
 # --- download model if not cached ---
@@ -58,33 +58,36 @@ else
     $PYTHON quantize.py --download qwen35b
 fi
 
-# --- quantize (PTQ only — teacher won't fit alongside student on 2x T4) ---
+# --- quantize ---
 echo ""
 echo "[4/5] quantizing Qwen3.6-35B-A3B (ternary, PTQ mode)..."
-echo "  note: teacher distillation skipped automatically"
-echo "  (35B MoE + teacher don't fit in 2x T4 + 32GB RAM)"
+echo "  note: teacher distillation skipped — 35B MoE + teacher won't fit"
 echo ""
 $PYTHON quantize.py --preset qwen35b \
     --device cuda:0 \
     --expert-batch 4 \
     --output Qwen3.6-35B-A3B-ternary
 
+# --- convert to GGUF ---
+echo ""
+echo "[5/5] converting to GGUF..."
+$PYTHON quantize.py --gguf Qwen3.6-35B-A3B-ternary \
+    --output Qwen3.6-35B-A3B-ternary.gguf
+
 echo ""
 echo "=============================================="
 echo "  done!"
 echo "=============================================="
 echo ""
-echo "outputs:"
-echo "  packed:  Qwen3.6-35B-A3B-ternary/"
-echo "  files:"
-echo "    quantized_weights.pt   — bit-packed scales + codes"
-echo "    quant_config.pt        — packing metadata"
-echo "    config.json            — model config"
-echo "    tokenizer*             — tokenizer files"
+echo "output:"
+echo "  GGUF: Qwen3.6-35B-A3B-ternary.gguf"
 echo ""
-echo "  this is the compressed model (~8-16x smaller than FP16)"
+echo "use with llama.cpp:"
+echo "  ./llama-server -m Qwen3.6-35B-A3B-ternary.gguf -c 4096"
 echo ""
-echo "  to use for inference, load with:"
-echo "    from quantize import unpack_q1_0, unpack_q2_0"
-echo "    state = torch.load('quantized_weights.pt')"
-echo "    config = torch.load('quant_config.pt')"
+echo "use with ollama:"
+echo "  ollama create qwen35b-ternary -f Modelfile"
+echo "  # Modelfile: FROM ./Qwen3.6-35B-A3B-ternary.gguf"
+echo ""
+echo "use with lmstudio:"
+echo "  drag Qwen3.6-35B-A3B-ternary.gguf into LM Studio"
