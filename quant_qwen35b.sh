@@ -69,27 +69,22 @@ $PYTHON quantize.py --preset qwen35b \
     --expert-batch 4 \
     --output Qwen3.6-35B-A3B-ternary
 
-# --- dequantize to safetensors for inference ---
-echo ""
-echo "[5/5] dequantizing to safetensors..."
-$PYTHON quantize.py --dequantize Qwen3.6-35B-A3B-ternary \
-    --output Qwen3.6-35B-A3B-ternary-fp16
-
 echo ""
 echo "=============================================="
 echo "  done!"
 echo "=============================================="
 echo ""
 echo "outputs:"
-echo "  packed:       Qwen3.6-35B-A3B-ternary/"
-echo "  dequantized:  Qwen3.6-35B-A3B-ternary-fp16/"
+echo "  packed:  Qwen3.6-35B-A3B-ternary/"
+echo "  files:"
+echo "    quantized_weights.pt   — bit-packed scales + codes"
+echo "    quant_config.pt        — packing metadata"
+echo "    config.json            — model config"
+echo "    tokenizer*             — tokenizer files"
 echo ""
-echo "dequantized model can be loaded with:"
-echo "  from transformers import AutoModelForCausalLM"
-echo "  model = AutoModelForCausalLM.from_pretrained("
-echo "      'Qwen3.6-35B-A3B-ternary-fp16',"
-echo "      device_map='auto',"
-echo "      torch_dtype=torch.float16,"
-echo "  )"
+echo "  this is the compressed model (~8-16x smaller than FP16)"
 echo ""
-echo "  compression ratio saved in Qwen3.6-35B-A3B-ternary/"
+echo "  to use for inference, load with:"
+echo "    from quantize import unpack_q1_0, unpack_q2_0"
+echo "    state = torch.load('quantized_weights.pt')"
+echo "    config = torch.load('quant_config.pt')"
