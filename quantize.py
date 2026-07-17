@@ -306,7 +306,7 @@ def save_gguf(packed_dir, output_path):
     writer.add_block_count(n_layers)
     writer.add_rope_freq_base(rope_theta)
     writer.add_layer_norm_rms_eps(rms_eps)
-    writer.add_file_type(gguf.GGMLFileType.ALL_F32)
+    writer.add_file_type(gguf.LlamaFileType.ALL_F32)
 
     # write tensors — unpack from packed format, write as F16
     for name, packed_data in state.items():
@@ -321,7 +321,7 @@ def save_gguf(packed_dir, output_path):
             tensor = packed_data.to(torch.float16)
 
         gguf_name = _map_tensor_name(name, arch)
-        writer.add_tensor(gguf_name, tensor.numpy(), raw_dtype=gguf.GGMLQuantizationType.F16)
+        writer.add_tensor(gguf_name, tensor.numpy())
         print(f"  {name} → {gguf_name}  {list(tensor.shape)}")
 
     writer.write_header_to_file()
