@@ -306,7 +306,7 @@ def save_gguf(packed_dir, output_path):
     writer.add_block_count(n_layers)
     writer.add_rope_freq_base(rope_theta)
     writer.add_layer_norm_rms_eps(rms_eps)
-    writer.add_file_type(gguf.LlamaFileType.ALL_F32)
+    writer.add_file_type(0)  # ALL_F32 = 0
 
     # write tensors — unpack from packed format, write as F16
     for name, packed_data in state.items():
