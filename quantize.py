@@ -225,7 +225,10 @@ _TENSOR_MAP = {
     "mlp.experts": "ffn_gate",  # MoE experts → handled separately
     "input_layernorm": "attn_norm",
     "post_attention_layernorm": "ffn_norm",
-    "norm": "output_norm",
+    "linear_attn.norm": "linear_norm",
+    "self_attn.q_norm": "attn_norm_q",
+    "self_attn.k_norm": "attn_norm_k",
+    "self_attn.norm": "attn_norm",
 }
 
 
@@ -235,7 +238,7 @@ def _map_tensor_name(name, arch):
     # embedding
     if "embed_tokens" in name:
         return "token_embd.weight"
-    # final norm
+    # final norm (model.norm.weight)
     if name.endswith(".norm.weight") and "layers" not in name:
         return "output_norm.weight"
     # lm_head
@@ -246,18 +249,19 @@ def _map_tensor_name(name, arch):
         if p == "layers" and i + 1 < len(parts):
             layer_idx = parts[i + 1]
             rest = ".".join(parts[i + 2:])
+            # MoE expert handling
+            if "experts" in rest:
+                exp_match = rest.split("experts.")
+                if len(exp_match) > 1:
+                    exp_idx = exp_match[1].split(".")[0]
+                    expert_part = ".".join(exp_match[1].split(".")[1:])
+                    for ehf, egguf in _TENSOR_MAP.items():
+                        if ehf in expert_part:
+                            return f"blk.{layer_idx}.{egguf}.{exp_idx}.weight"
+            # Standard tensor mapping
             for hf_key, gguf_key in _TENSOR_MAP.items():
                 if hf_key in rest:
                     suffix = rest.split(hf_key)[-1]
-                    # MoE expert handling: mlp.experts.{e}.gate_proj → ffn_gate.{e}
-                    if "experts" in rest:
-                        exp_match = rest.split("experts.")
-                        if len(exp_match) > 1:
-                            exp_idx = exp_match[1].split(".")[0]
-                            expert_part = ".".join(exp_match[1].split(".")[1:])
-                            for ehf, egguf in _TENSOR_MAP.items():
-                                if ehf in expert_part:
-                                    return f"blk.{layer_idx}.{egguf}.{exp_idx}.weight"
                     return f"blk.{layer_idx}.{gguf_key}{suffix}"
     return name
 
