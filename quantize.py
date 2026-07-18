@@ -444,12 +444,12 @@ def get_gpu_info():
     return devs
 
 
-def check_disk_space(min_gb=20):
+def check_disk_space(min_gb=50):
     """Check if enough disk space is available. Returns True if OK."""
     import shutil
     disk_free = shutil.disk_usage("/").free / (1024**3)
     if disk_free < min_gb:
-        print(f"  WARNING: Only {disk_free:.1f} GB free disk (need {min_gb} GB)")
+        print(f"  ERROR: Only {disk_free:.1f} GB free disk (hard limit {min_gb} GB)")
         return False
     return True
 
@@ -1008,12 +1008,13 @@ def main():
     if args.download:
         dl_id = PRESETS[args.download]["model"] if args.download in PRESETS else args.download
         
-        # Check disk space before downloading
+        # Check disk space before downloading (50GB hard limit)
         import shutil
         disk_free = shutil.disk_usage("/").free / (1024**3)
-        if disk_free < 20:
-            print(f"WARNING: Only {disk_free:.1f} GB free disk. Need at least 20 GB.")
-            print("  Consider using a smaller model or clearing disk space.")
+        if disk_free < 50:
+            print(f"ERROR: Only {disk_free:.1f} GB free disk. Hard limit is 50 GB.")
+            print("  Clear disk space or use a smaller model.")
+            return
         
         # Try NVFP4 first (smaller, ~18GB)
         nvfp4_id = f"unsloth/{dl_id.split('/')[-1]}-NVFP4"
