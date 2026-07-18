@@ -741,14 +741,34 @@ def load_with_unsloth(model_id, dtype, load_4bit, device_map="auto"):
 
 
 def load_teacher_unsloth(model_id, dtype, load_4bit=False):
-    """Load teacher model — tries fp16 first, falls back to 4-bit if OOM."""
+    """Load teacher model — uses bitsandbytes 4-bit quant to fit in VRAM."""
+    # Always use bitsandbytes 4-bit for teacher to save VRAM
     try:
-        from unsloth import FastLanguageModel, FastModel
-        for attempt in range(2):
-            use_4bit = load_4bit or (attempt == 1)
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        import torch
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+            offload_folder="offload",
+        )
+        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        return model, tok
+    except Exception as e:
+        print(f"  bitsandbytes 4-bit failed: {e}")
+        # Fallback to Unsloth
+        try:
+            from unsloth import FastLanguageModel, FastModel
             kw = dict(
                 model_name=model_id, max_seq_length=4096,
-                load_in_4bit=use_4bit, dtype=dtype,
+                load_in_4bit=True, dtype=dtype,
                 trust_remote_code=True,
                 offload_folder="offload",
             )
@@ -756,25 +776,9 @@ def load_teacher_unsloth(model_id, dtype, load_4bit=False):
                 model, tok = FastModel.from_pretrained(**kw)
             except Exception:
                 model, tok = FastLanguageModel.from_pretrained(**kw)
-            # check for fp32 OOM
-            total_gb = sum(p.numel() for p in model.parameters()) * 4 / (1024**3)
-            free_gb = get_total_free_vram_gb()
-            if total_gb > free_gb:
-                print(f"  teacher fp32 ({total_gb:.0f} GB) too large, retrying 4-bit...")
-                del model
-                gc.collect()
-                torch.cuda.empty_cache()
-                continue
             return model, tok
-        # fall through — even 4-bit failed somehow
-        raise RuntimeError("teacher loading failed after 2 attempts")
-    except ImportError:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=dtype, device_map="auto",
-            trust_remote_code=True, load_in_4bit=True,
-            offload_folder="offload",
-        )
+        except Exception as e2:
+            raise RuntimeError(f"teacher loading failed: {e2}")
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         return model, tok
 
