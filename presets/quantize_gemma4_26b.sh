@@ -13,7 +13,7 @@ echo "=============================================="
 
 # --- HF cache on /tmp (more disk space on Kaggle) ---
 if [ -n "${KAGGLE_KERNEL_RUN_TYPE:-}" ]; then
-    export HF_HOME="/tmp/hf_cache"
+    export HF_HOME="/dev/shm/hf_cache"
     WORK_DIR="/tmp/quant_work"
 else
     export HF_HOME="$HOME/.cache/huggingface"

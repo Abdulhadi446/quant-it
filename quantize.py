@@ -13,9 +13,12 @@ from pathlib import Path
 
 # set HF cache to persistent directory
 if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
-    # Kaggle: /tmp has more disk space than /kaggle/working
+    # Kaggle: use /dev/shm (RAM-backed) for cache, no disk usage
     if "HF_HOME" not in os.environ:
-        os.environ["HF_HOME"] = "/tmp/hf_cache"
+        os.environ["HF_HOME"] = "/dev/shm/hf_cache"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    # Disable symlink warnings on Kaggle
+    os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 elif "HF_HOME" not in os.environ:
     # local: use ~/.cache (not ./cache)
     os.environ["HF_HOME"] = str(Path.home() / ".cache" / "huggingface")
@@ -439,6 +442,29 @@ def get_gpu_info():
         free, total = torch.cuda.mem_get_info(i)
         devs.append((i, name, free / (1024**3), total / (1024**3)))
     return devs
+
+
+def check_disk_space(min_gb=20):
+    """Check if enough disk space is available. Returns True if OK."""
+    import shutil
+    disk_free = shutil.disk_usage("/").free / (1024**3)
+    if disk_free < min_gb:
+        print(f"  WARNING: Only {disk_free:.1f} GB free disk (need {min_gb} GB)")
+        return False
+    return True
+
+
+def cleanup_cache():
+    """Clean up HF cache to free disk space."""
+    import shutil
+    cache_dir = os.environ.get("HF_HOME", "")
+    if cache_dir and os.path.exists(cache_dir):
+        try:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            os.makedirs(cache_dir, exist_ok=True)
+            print(f"  cleaned cache: {cache_dir}")
+        except Exception:
+            pass
 
 
 def get_total_free_vram_gb():
@@ -981,10 +1007,27 @@ def main():
     # --download: pre-download model to HF cache
     if args.download:
         dl_id = PRESETS[args.download]["model"] if args.download in PRESETS else args.download
-        print(f"downloading {dl_id} to HF cache...")
+        
+        # Check disk space before downloading
+        import shutil
+        disk_free = shutil.disk_usage("/").free / (1024**3)
+        if disk_free < 20:
+            print(f"WARNING: Only {disk_free:.1f} GB free disk. Need at least 20 GB.")
+            print("  Consider using a smaller model or clearing disk space.")
+        
+        # Try NVFP4 first (smaller, ~18GB)
+        nvfp4_id = f"unsloth/{dl_id.split('/')[-1]}-NVFP4"
+        try:
+            from transformers import AutoConfig
+            AutoConfig.from_pretrained(nvfp4_id, trust_remote_code=True)
+            print(f"downloading {nvfp4_id} (NVFP4, ~18 GB) to HF cache...")
+            dl_id = nvfp4_id
+        except Exception:
+            print(f"NVFP4 not available, downloading {dl_id} (fp16, ~72 GB) to HF cache...")
+            print(f"  WARNING: This may exceed disk limits!")
+        
         print(f"  cache: {os.environ['HF_HOME']}")
-        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-        AutoConfig.from_pretrained(dl_id, trust_remote_code=True)
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         AutoTokenizer.from_pretrained(dl_id, trust_remote_code=True)
         AutoModelForCausalLM.from_pretrained(
             dl_id, torch_dtype=torch.float16,
