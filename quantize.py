@@ -741,8 +741,25 @@ def load_with_unsloth(model_id, dtype, load_4bit, device_map="auto"):
 
 
 def load_teacher_unsloth(model_id, dtype, load_4bit=False):
-    """Load teacher model — uses bitsandbytes 4-bit quant to fit in VRAM."""
-    # Always use bitsandbytes 4-bit for teacher to save VRAM
+    """Load teacher model — uses pre-quantized NVFP4 if available, else bitsandbytes 4-bit."""
+    # Try pre-quantized NVFP4 model first (fastest, smallest)
+    nvfp4_id = f"unsloth/{model_id.split('/')[-1]}-NVFP4"
+    try:
+        from unsloth import FastLanguageModel
+        print(f"  trying pre-quantized teacher: {nvfp4_id}")
+        model, tok = FastLanguageModel.from_pretrained(
+            model_name=nvfp4_id,
+            max_seq_length=4096,
+            load_in_4bit=True,
+            dtype=dtype,
+            trust_remote_code=True,
+            offload_folder="offload",
+        )
+        return model, tok
+    except Exception as e:
+        print(f"  NVFP4 not available ({e}), trying bitsandbytes 4-bit...")
+
+    # Fallback to bitsandbytes NF4 quantization
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         import torch
@@ -762,23 +779,18 @@ def load_teacher_unsloth(model_id, dtype, load_4bit=False):
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         return model, tok
     except Exception as e:
-        print(f"  bitsandbytes 4-bit failed: {e}")
-        # Fallback to Unsloth
-        try:
-            from unsloth import FastLanguageModel, FastModel
-            kw = dict(
-                model_name=model_id, max_seq_length=4096,
-                load_in_4bit=True, dtype=dtype,
-                trust_remote_code=True,
-                offload_folder="offload",
-            )
-            try:
-                model, tok = FastModel.from_pretrained(**kw)
-            except Exception:
-                model, tok = FastLanguageModel.from_pretrained(**kw)
-            return model, tok
-        except Exception as e2:
-            raise RuntimeError(f"teacher loading failed: {e2}")
+        print(f"  bitsandbytes failed: {e}")
+        # Final fallback to Unsloth
+        from unsloth import FastLanguageModel
+        model, tok = FastLanguageModel.from_pretrained(
+            model_name=model_id,
+            max_seq_length=4096,
+            load_in_4bit=True,
+            dtype=dtype,
+            trust_remote_code=True,
+            offload_folder="offload",
+        )
+        return model, tok
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         return model, tok
 
